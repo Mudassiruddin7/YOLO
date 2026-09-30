@@ -1,0 +1,2 @@
+family,model,imgsz,epochs,seeds,test_dAP,test_dAP_lo,test_dAP_hi,test_dAP50,test_dAP50_lo,test_dAP50_hi,B
+v10s,graftd/role_ws,640,90,"0,1,2",0.7327902632475336,0.49421672221197344,0.9619142063562285,1.2532865319232265,0.8533078981487534,1.616903657270395,200

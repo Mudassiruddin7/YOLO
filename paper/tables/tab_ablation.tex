@@ -1,0 +1,19 @@
+\begin{tabular}{lrrrrr}
+\toprule
+Variant & $n$ & GFLOPs & Test-dev AP & Val AP & Gain \\
+\midrule
+YOLOv10n baseline & 3 & 6.6 & 13.46$\pm$0.09 & 16.22$\pm$0.04 & -- \\
+\midrule
+P2 level, random init & 3 & 12.7 & 13.72$\pm$0.02 & 17.15$\pm$0.19 & +0.26 \\
+P2 level, key-matched weights & 3 & 12.7 & 13.94$\pm$0.05 & 17.08$\pm$0.21 & +0.48 \\
+P2 level, warm start & 3 & 12.7 & 14.39$\pm$0.08 & 18.05$\pm$0.02 & +0.92 \\
+\midrule
+2$\times$ deeper block, random init & 1 & 13.7 & 13.76 & 17.05 & +0.26 \\
+\textbf{2$\times$ deeper block, warm start} & 3 & 13.7 & \textbf{14.52$\pm$0.17} & 18.48$\pm$0.05 & \textbf{+1.05} \\
+3$\times$ deeper block, warm start & 1 & 14.8 & 14.66 & 18.30 & +1.16 \\
+\midrule
+detail injection, 16 channels & 3 & 6.9 & 14.08$\pm$0.08 & 17.16$\pm$0.21 & +0.61 \\
+\midrule
+P2-assisted P3, 32 channels & 1 & 8.8 & 14.49 & 17.82 & +1.00 \\
+\bottomrule
+\end{tabular}

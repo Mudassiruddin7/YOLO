@@ -1,0 +1,26 @@
+\begin{tabular}{llrrrrr}
+\toprule
+Model & Input & $n$ & GFLOPs & Test-dev AP & Val AP & Gain \\
+\midrule
+\multicolumn{7}{l}{\textit{YOLOv10n, 90 epochs}} \\
+baseline & 640 & 3 & 6.6 & 14.09$\pm$0.09 & 17.75$\pm$0.26 & -- \\
+P2-Graft & 640 & 3 & 13.7 & \textbf{15.77$\pm$0.20} & 20.64$\pm$0.09 & \textbf{+1.68} \\
+\addlinespace[1pt]
+baseline & 896 & 3 & 13.0 & 18.16$\pm$0.10 & 23.23$\pm$0.07 & -- \\
+P2-Graft (batch 16) & 896 & 3 & 27.0 & \textbf{18.74$\pm$0.31} & 24.07$\pm$0.10 & \textbf{+0.58} \\
+P2-Graft (batch 32) & 896 & 1 & 27.0 & 19.51 & 25.25 & +1.31 \\
+\addlinespace[1pt]
+baseline & 1280 & 1 & 27.1 & 22.45 & 28.44 & -- \\
+P2-Graft & 1280 & 1 & 55.6 & 22.32 & 29.14 & \textbf{$-$0.13} \\
+\addlinespace[1pt]
+baseline & 1536 & 1 & 39.7 & 23.89 & 30.29 & -- \\
+\midrule
+\multicolumn{7}{l}{\textit{YOLOv10n, 150 epochs}} \\
+baseline & 640 & 1 & 6.6 & 14.46 & 18.37 & -- \\
+P2-Graft & 640 & 1 & 13.7 & \textbf{15.63} & 19.86 & \textbf{+1.17} \\
+\midrule
+\multicolumn{7}{l}{\textit{YOLOv10s, 90 epochs}} \\
+baseline & 640 & 3 & 21.6 & 17.46$\pm$0.13 & 21.98$\pm$0.13 & -- \\
+P2-Graft & 640 & 3 & 39.8 & \textbf{18.19$\pm$1.17} & 23.29$\pm$1.74 & \textbf{+0.73} \\
+\bottomrule
+\end{tabular}

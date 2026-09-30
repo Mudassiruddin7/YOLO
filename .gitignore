@@ -1,0 +1,9 @@
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+__marimo__/

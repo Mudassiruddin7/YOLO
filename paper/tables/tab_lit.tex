@@ -1,0 +1,20 @@
+\begin{tabular}{llrrrrl}
+\toprule
+Model & Input & Params (M) & GFLOPs & AP & AP$_{50}$ & Source \\
+\midrule
+YOLOv8-N & 640 & 3.2 & 8.7 & 19.6 & 33.3 & \cite{xiao2025fbrt} \\
+FBRT-YOLO-N & 640 & 0.9 & 6.7 & 20.2 & 34.4 & \cite{xiao2025fbrt} \\
+YOLOv10-S & 640 & 7.2 & 21.6 & 23.8 & 39.3 & \cite{xiao2025fbrt} \\
+YOLOv8-S & 640 & 11.2 & 28.6 & 23.6 & 39.6 & \cite{xiao2025fbrt} \\
+FBRT-YOLO-S & 640 & 2.9 & 22.9 & 25.9 & 42.4 & \cite{xiao2025fbrt} \\
+FBRT-YOLO-M & 640 & 7.2 & 58.7 & 28.4 & 45.9 & \cite{xiao2025fbrt} \\
+DroneScan-YOLO & 1280 & 10.23 & -- & 35.6 & 55.3 & \cite{bellec2026dronescan} \\
+\midrule
+YOLOv10n baseline & 640 & 2.27 & 6.6 & 17.75 & 31.77 & \\
+\textbf{P2-Graft, YOLOv10n} & \textbf{640} & \textbf{2.41} & \textbf{13.7} & \textbf{20.64} & \textbf{35.96} & \\
+YOLOv10s baseline & 640 & 7.22 & 21.6 & 21.98 & 38.16 & \\
+\textbf{P2-Graft, YOLOv10s} & \textbf{640} & \textbf{7.58} & \textbf{39.8} & \textbf{23.29} & \textbf{39.86} & \\
+\textbf{P2-Graft, YOLOv10n} & \textbf{1280} & \textbf{2.41} & \textbf{55.6} & \textbf{29.14} & \textbf{47.75} & \\
+\textbf{YOLOv10n baseline} & \textbf{1536} & \textbf{2.27} & \textbf{39.7} & \textbf{30.29} & \textbf{49.42} & \\
+\bottomrule
+\end{tabular}
