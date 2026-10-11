@@ -4291,7 +4291,7 @@ def _(mo):
 
 @app.cell
 def _(mo):
-    auto_ok = mo.ui.checkbox(label="I understand: this downloads ≈ 2 GB, runs ≈ 30–60 min of checks and then starts a long background training job with the budget set in ①")
+    auto_ok = mo.ui.checkbox(value=True, label="Start automatically when the notebook is run (Run all). I understand: this downloads ≈ 2 GB, runs ≈ 30–60 min of checks and then starts a long background training job with the budget set in ①")
     auto_btn = mo.ui.run_button(label="⓪ AUTOPILOT: environment → data → analyses → smoke test → calibration → launch")
     mo.vstack([mo.md("## ⓪ Autopilot (recommended)\nRuns the numbered steps ② – ⑦ in one go and stops at the first failure with the reason. Idempotent: if something fails, fix it and press it again — "
                      "finished parts are skipped. While it runs the notebook is busy (progress goes to the console below and to `logs/autopilot.log`)."), auto_ok, auto_btn])
@@ -4351,7 +4351,7 @@ def _(PROBE, fix_btn, mo):
 
 @app.cell
 def _(WORK, auto_btn, auto_ok, boot_ui, budget_h, epochs_ui, iso_ui, mo, seeds_ui, template_ui, tiers_ui):
-    mo.stop(not (auto_btn.value and auto_ok.value), mo.md("*Autopilot not started. Tick the box and press the button — or use the numbered steps below.*"))
+    mo.stop(not (auto_ok.value or auto_btn.value), mo.md("*Autopilot not started. Tick the box and press the button — or use the numbered steps below.*"))
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_study.py")
     AUTO = autopilot(WORK, budget_h=float(budget_h.value), seeds=tuple(int(s) for s in seeds_ui.value) or (0, 1, 2), tiers=tuple(int(t) for t in tiers_ui.value) or (0, 1),
                      epochs=int(epochs_ui.value or 0), iso_size=int(iso_ui.value), notebook_file=str(_nb), template=template_ui.value, bootstrap=int(boot_ui.value),
@@ -4556,15 +4556,16 @@ def _(WORK, mo, refresh):
 
 @app.cell
 def _(mo):
+    keep_auto = mo.ui.checkbox(value=True, label="Keep the session busy automatically until the worker has finished (Run all will then stay running)")
     keep_btn = mo.ui.run_button(label="Keep this session busy until the worker has finished (blocks the notebook; press the stop button to interrupt)")
-    mo.vstack([mo.md("### Keep-alive (optional)\nmolab shuts a notebook down after 90 minutes without activity. The auto-refresh above keeps an open tab active; if you will close the tab, "
+    mo.vstack([keep_auto, mo.md("### Keep-alive (optional)\nmolab shuts a notebook down after 90 minutes without activity. The auto-refresh above keeps an open tab active; if you will close the tab, "
                      "this loop keeps the kernel itself busy while the worker trains. Whether molab counts it as activity is not documented — keeping the tab open is the safe option."), keep_btn])
-    return (keep_btn,)
+    return keep_auto, keep_btn
 
 
 @app.cell
-def _(WORK, keep_btn, mo):
-    mo.stop(not keep_btn.value, mo.md("*Keep-alive not running.*"))
+def _(AUTO, WORK, keep_auto, keep_btn, mo):
+    mo.stop(not (keep_auto.value or keep_btn.value), mo.md("*Keep-alive not running.*"))
     _t0 = time.time()
     while True:
         _w = jload(WORK / "worker.json", {})
