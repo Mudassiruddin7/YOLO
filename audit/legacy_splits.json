@@ -1,0 +1,24 @@
+{
+ "internal_holdout_recreated": {
+  "n_images": 647,
+  "legacy_protocol(conf>0.25)": {
+   "mAP50": 24.998073279857635,
+   "mAP50_95": 13.105370104312897
+  },
+  "standard_protocol(conf>0.001)": {
+   "mAP50": 31.36078417301178,
+   "mAP50_95": 15.302801132202148
+  }
+ },
+ "test_dev": {
+  "n_images": 1610,
+  "legacy_protocol(conf>0.25)": {
+   "mAP50": 17.89356917142868,
+   "mAP50_95": 8.922700583934784
+  },
+  "standard_protocol(conf>0.001)": {
+   "mAP50": 22.149372100830078,
+   "mAP50_95": 10.35352349281311
+  }
+ }
+}
