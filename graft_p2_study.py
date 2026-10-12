@@ -56,6 +56,16 @@ with app.setup:
     STUDY_VERSION = "1.0.0"
     ULTRALYTICS_PIN = "8.4.150"
     ROUND1_EPOCHS = 35  # schedule of the main study; round 2 (tier 4) extends it and must use the same one
+    # candidates of the improvement search (variant, transfer rule, run-id tag, label); every one starts exactly at the pretrained detector
+    SEARCH_POOL = (
+        ("base", "role", "f16", "YOLOv10n baseline"),
+        ("graft", "role", "f16", "P2-Graft"),
+        ("graft", "role_ws", "ws", "P2-Graft, warm-started level"),
+        ("graftd", "role_ws", "ws", "P2-Graft deep, warm-started"),
+        ("inj16", "role", "f16", "detail injection (16 ch)"),
+        ("assist32", "role", "f16", "P2-assisted P3 (32 ch)"),
+    )
+    UNITS_PER_HOUR = 3.8  # base-640-35-epoch-equivalents trained per hour of wall time with 3 runs in parallel (measured: 30.7 units in 7.3 h)
     try:  # path of this notebook file (needed to start the detached worker); marimo provides __file__
         NOTEBOOK_FILE = Path(__file__).resolve()
     except NameError:  # pragma: no cover
@@ -526,6 +536,9 @@ def make_variant_cfg(base, variant, p2_backbone_idx=2):
     naive   : textbook P2 re-wiring (YOLOv8-P2 style). The P2 output feeds a new bottom-up path, so every layer after
               the P3 top-down block changes role.
     replace : graft-style P2 branch, but the P5 level and its neck layers are removed (P2/P3/P4 heads).
+    graftd  : graft with a twice as deep stride-4 neck block.
+    injC    : no stride-4 level; the P3 head also sees C channels of a strided conv of the stride-4 backbone feature (detail injection).
+    assistC : no stride-4 level; the stride-4 neck block is computed and C channels of its strided conv go into the P3 head (P2-assisted P3).
     """
     cfg = copy.deepcopy(base)
     bb, head = cfg["backbone"], cfg["head"]
@@ -543,6 +556,21 @@ def make_variant_cfg(base, variant, p2_backbone_idx=2):
     p2_block = [-1] + copy.deepcopy(p3_spec[1:])  # same block type / repeats / args as the P3 neck block
     up_spec = [p3_idx, 1, "nn.Upsample", [None, 2, "nearest"]]
     cat_spec = [[-1, p2_backbone_idx], 1, "Concat", [1]]
+    if variant == "graftd":  # graft with a twice as deep stride-4 neck block
+        p2_block[1] = max(2, 2 * int(p2_block[1]))
+        variant = "graft"
+    m_inj = re.fullmatch(r"inj(\d+)", variant)
+    if m_inj:  # detail injection: the P3 head additionally sees a strided conv of the stride-4 backbone feature (new input channels, zero weights at start)
+        c_arg = int(m_inj.group(1)) * 4  # yaml width of the nano scale is 0.25
+        cfg["head"] = body + [[p2_backbone_idx, 1, "Conv", [c_arg, 3, 2]], [[p3_idx, -1], 1, "Concat", [1]],
+                              [[n_before + 1, p4_idx, p5_idx], 1, det[2], det[3]]]
+        return cfg
+    m_as = re.fullmatch(r"assist(\d+)", variant)
+    if m_as:  # P2-assisted P3: the stride-4 neck block (no stride-4 prediction level) is folded into the P3 head input
+        c_arg = int(m_as.group(1)) * 4
+        cfg["head"] = body + [up_spec, cat_spec, p2_block, [-1, 1, "Conv", [c_arg, 3, 2]], [[p3_idx, -1], 1, "Concat", [1]],
+                              [[n_before + 4, p4_idx, p5_idx], 1, det[2], det[3]]]
+        return cfg
     if variant == "graft":
         cfg["head"] = body + [up_spec, cat_spec, p2_block] + [[[p3_idx, p4_idx, p5_idx, n_before + 2], 1, det[2], det[3]]]
         return cfg
@@ -614,8 +642,8 @@ def role_key_rename(variant, n_base_layers=23):
 
     if variant == "base":
         return keep, (lambda k: False)
-    if variant == "graft":
-        det_new = n_base_layers + 3
+    if variant in ("graft", "graftd", "inj", "assist") or re.fullmatch(r"(inj|assist)\d+", variant):
+        det_new = n_base_layers + {"graft": 3, "graftd": 3}.get(variant, 2 if variant.startswith("inj") else 5)
 
         def rn(k):
             return k.replace(pref(det_old), pref(det_new), 1) if k.startswith(pref(det_old)) else k
@@ -634,6 +662,56 @@ def role_key_rename(variant, n_base_layers=23):
 
 
 @app.function
+def warm_start_p2_entries(csd, msd, variant, n_base_layers=23, p3_block_idx=16):
+    """Extra checkpoint entries that initialise the NEW stride-4 level of a graft from the pretrained P3 level instead of at random
+    (the P3 neck block -> the P2 neck block where the shapes agree, the level-0 detection convs -> the level-3 ones).  The original levels are not touched,
+    so the function-preserving property of the graft is unchanged."""
+    det_new = n_base_layers + 3
+    blk_new = n_base_layers + 2
+    extra: Dict[str, Any] = {}
+    for k, v in csd.items():
+        if k.startswith(f"model.{p3_block_idx}."):
+            tail = k[len(f"model.{p3_block_idx}."):]
+            cands = [f"model.{blk_new}.{tail}"]
+            if variant == "graftd" and tail.startswith("m.0."):
+                cands.append(f"model.{blk_new}.m.1.{tail[len('m.0.'):]}")
+            for nk in cands:
+                if nk in msd and tuple(msd[nk].shape) == tuple(v.shape):
+                    extra[nk] = v
+        m = re.match(rf"model\.{det_new}\.(cv2|cv3|one2one_cv2|one2one_cv3)\.0\.(.*)", k)
+        if m:
+            nk = f"model.{det_new}.{m.group(1)}.3.{m.group(2)}"
+            if nk in msd and tuple(msd[nk].shape) == tuple(v.shape):
+                extra[nk] = v
+    return extra
+
+
+@app.function
+def fit_state(msd, csd):
+    """Entries of the checkpoint `csd` that fit the model state `msd`.  Tensors of equal shape are copied; a tensor that is LARGER in the model (the P3 head of an
+    injection variant receives extra input channels) starts from the model's own initialisation with the pretrained values written into the leading block,
+    and the weights of the extra INPUT channels of a convolution are set to zero, so that the extended network computes exactly what the pretrained one did.
+    Returns (state to load, number of source parameters used)."""
+    upd: Dict[str, Any] = {}
+    n_src = 0
+    for k, v in csd.items():
+        if k not in msd:
+            continue
+        t = msd[k]
+        if tuple(v.shape) == tuple(t.shape):
+            upd[k] = v
+            n_src += int(v.numel())
+        elif v.dim() == t.dim() and v.dim() > 0 and all(a <= b for a, b in zip(v.shape, t.shape)):
+            new = t.detach().clone()
+            new[tuple(slice(0, a) for a in v.shape)] = v.to(new.dtype)
+            if v.dim() == 4 and t.shape[1] > v.shape[1]:
+                new[:, v.shape[1]:] = 0
+            upd[k] = new
+            n_src += int(v.numel())
+    return upd, n_src
+
+
+@app.function
 def transfer_weights(model, pre_model, variant, mode, base_cfg=None, var_cfg=None):
     """Copy pretrained weights into `model`.
        mode='role': explicit role-based key map (graft / replace / base)    -> every copied tensor is role-aligned
@@ -647,9 +725,14 @@ def transfer_weights(model, pre_model, variant, mode, base_cfg=None, var_cfg=Non
     if mode == "none":
         acc.update(tensors_transferred=0, params_transferred=0, tensors_aligned=0, params_aligned=0, cls_rows_remapped=0)
         return acc
-    if mode == "role":
+    ws_keys: set = set()
+    if mode in ("role", "role_ws"):
         rename, drop = role_key_rename(variant)
         csd = {rename(k): v for k, v in pre_sd.items() if not drop(k)}
+        if mode == "role_ws":
+            ws = warm_start_p2_entries(csd, model.state_dict(), variant)
+            ws_keys = set(ws)
+            csd.update(ws)
         aligned_keys = set(csd)
     elif mode == "key":
         csd = dict(pre_sd)
@@ -657,12 +740,19 @@ def transfer_weights(model, pre_model, variant, mode, base_cfg=None, var_cfg=Non
     else:
         raise ValueError(mode)
     cls_remapped = model._remap_cls_by_names(csd, pre_model, verbose=False)
-    upd = intersect_dicts(csd, model.state_dict())
+    if mode == "key":
+        upd = intersect_dicts(csd, model.state_dict())
+        n_src = int(sum(v.numel() for v in upd.values()))
+    else:
+        upd, n_src = fit_state(model.state_dict(), csd)
     model.load_state_dict(upd, strict=False)
     acc["cls_rows_remapped"] = int(cls_remapped)
     acc["tensors_transferred"] = len(upd) + int(cls_remapped)
-    acc["params_transferred"] = int(sum(v.numel() for v in upd.values()))
-    if mode == "role":
+    acc["params_transferred"] = n_src
+    if ws_keys:
+        acc["params_warm_started"] = int(sum(int(upd[k].numel()) for k in ws_keys if k in upd))
+        acc["params_transferred"] = n_src - acc["params_warm_started"]
+    if mode in ("role", "role_ws"):
         acc["tensors_aligned"], acc["params_aligned"] = acc["tensors_transferred"], acc["params_transferred"]
     else:
         # key-matching copies by index; a copied tensor is role-aligned only if the whole sub-graph feeding that layer
@@ -732,7 +822,7 @@ def model_stats(model, imgsz=640):
 
 
 @app.function
-def exactness_report(work, family="v10", variants=("graft", "replace"), seed=0):
+def exactness_report(work, family="v10", variants=("graft", "replace"), seed=0, modes=None):
     """Numerically verify that the grafted model reproduces the pretrained detector on its original levels.
     Compares neck features and the raw outputs of the four prediction branches (one2many/one2one x box/cls)."""
     import torch
@@ -750,7 +840,8 @@ def exactness_report(work, family="v10", variants=("graft", "replace"), seed=0):
     h.remove()
     for v in variants:
         m = build_detection_model(make_variant_cfg(base, v), nc=nc)
-        acc = transfer_weights(m, pre, v, "role")
+        mode = (modes or {}).get(v, "role")
+        acc = transfer_weights(m, pre, v, mode)
         m.eval()
         h = m.model[-1].register_forward_pre_hook(lambda mod, a: store.__setitem__("var", [t.clone() for t in a[0]]))
         with torch.no_grad():
@@ -758,8 +849,9 @@ def exactness_report(work, family="v10", variants=("graft", "replace"), seed=0):
         h.remove()
         det_p, det_v = pre.model[-1], m.model[-1]
         # level correspondence: graft keeps P3,P4,P5 as levels 0,1,2 ; replace keeps P3,P4 as levels 0,1
-        n_cmp = 3 if v == "graft" else 2
-        feat_diff = [float((store["pre"][i] - store["var"][i]).abs().max()) for i in range(n_cmp)]
+        n_cmp = 2 if v == "replace" else 3
+        # (an injection variant feeds the P3 head extra input channels: compare the pretrained channels, the head comparison below uses them all)
+        feat_diff = [float((store["pre"][i] - store["var"][i][:, :store["pre"][i].shape[1]]).abs().max()) for i in range(n_cmp)]
         raw = []
         with torch.no_grad():
             for i in range(n_cmp):
@@ -1534,9 +1626,168 @@ def make_plan(epochs, seeds=(0, 1, 2), batch=32, families=("v10",), tiers=(0, 1,
 
 
 @app.function
+def bigger_eval_sizes(imgsz):
+    """Test sizes above the training size (no retraining): 640 -> 800 and 960; 896 -> 1024."""
+    return (800, 960) if imgsz <= 640 else (int(round(imgsz * 1.15 / 32.0)) * 32,)
+
+
+@app.function
+def make_search_plan(epochs=ROUND1_EPOCHS, seeds=(0, 1, 2), batch=32, family="v10", finals=((640, 100), (896, 100))):
+    """Improvement search.  Stage A (tier 5, one seed, short schedule): every candidate of SEARCH_POOL under the identical recipe.  Stage B (tier 6): more seeds of
+    the baseline now and, once stage A is complete, of the candidate that is best on VALIDATION (and of P2-Graft as the reference).  Stage C (tier 7): the baseline
+    and the selected candidate trained long at one or two resolutions.  The candidate is chosen by validation AP only; test-dev is never used for any decision.
+    Returns (specs of everything known in advance, the `adaptive` dict that search_extend() needs)."""
+    P: List[RunSpec] = []
+
+    def add(tier, variant, transfer, tag, group, seed, imgsz=640, ep=None, eval_sizes=(), notes=""):
+        rid = run_id_for(family, variant, tag, seed)
+        if any(x.run_id == rid for x in P):
+            return
+        P.append(RunSpec(run_id=rid, group=group, family=family, variant=variant, transfer=transfer, seed=seed, epochs=ep or epochs, imgsz=imgsz,
+                         floor=16, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
+    seeds = tuple(seeds)
+    for v, t, tag, lab in SEARCH_POOL:
+        add(5, v, t, tag, lab, seeds[0], notes="search: explore")
+    explore_ids = [x.run_id for x in P]
+    for sd in seeds[1:]:
+        add(6, "base", "role", "f16", SEARCH_POOL[0][3], sd, notes="search: confirm")
+    # (the long baseline runs are queued by search_extend() AFTER the selected candidate's long runs, which are the longest jobs and must start first)
+    adaptive = {"mode": "search", "family": family, "seeds": list(seeds), "epochs": int(epochs), "batch": int(batch), "finals": [list(f) for f in finals],
+                "explore_ids": explore_ids}
+    return P, adaptive
+
+
+@app.function
+def fit_finals(budget_h, finals=((640, 100), (896, 100)), n_seeds=3, epochs=ROUND1_EPOCHS, units_per_hour=UNITS_PER_HOUR):
+    """Shrink the final schedules (multiples of 10 epochs, at least 40) until stage A + B + C fit into the budget."""
+    unit = lambda variant, imgsz, ep: cost_factor(RunSpec(run_id="x", group="x", variant=variant, imgsz=imgsz)) * ep / ROUND1_EPOCHS
+    ab = sum(unit(v, 640, epochs) for v, *_ in SEARCH_POOL)                                # stage A
+    ab += (n_seeds - 1) * (unit("base", 640, epochs) + 2 * unit("graft", 640, epochs))     # stage B: base, selected (<= graft-like) and the graft reference
+    cap = budget_h * units_per_hour * 0.9
+    want = sum(unit("base", sz, ep) + unit("graft", sz, ep) for sz, ep in finals)
+    room = max(cap - ab, 0.25 * want)
+    k = min(1.0, room / max(want, 1e-9))
+    return [(sz, max(40, int(ep * k) // 10 * 10)) for sz, ep in finals]
+
+
+@app.function
+def search_extend(work, adaptive, log_path=None):
+    """Stage A is complete: choose the candidate with the best VALIDATION AP (ties within 0.1 AP -> the cheaper one) and return the specs of stage B/C for it.
+    Returns (list of RunSpec dicts, selection record).  The record is also written to search_selection.json."""
+    df = collect_results(work)
+    pool = {(v, t): (tag, lab) for v, t, tag, lab in SEARCH_POOL}
+    ids = set(adaptive["explore_ids"])
+    rows = [r for _, r in df.iterrows() if r["run_id"] in ids] if len(df) else []
+    cand = [r for r in rows if r["variant"] != "base" and isnum(r.get("val_AP"))]
+    sel = {"candidates": {r["run_id"]: {"val_AP": float(r["val_AP"]), "gflops": float(r["gflops"]) if isnum(r.get("gflops")) else None} for r in cand},
+           "baseline_val_AP": next((float(r["val_AP"]) for r in rows if r["variant"] == "base" and isnum(r.get("val_AP"))), None), "chosen": None}
+    if not cand:
+        jdump(sel, Path(work) / "search_selection.json")
+        return [], sel
+    top = max(float(r["val_AP"]) for r in cand)
+    near = [r for r in cand if float(r["val_AP"]) >= top - 0.10]
+    best = min(near, key=lambda r: float(r["gflops"]) if isnum(r.get("gflops")) else 1e9)
+    v, t = str(best["variant"]), str(best["transfer"])
+    tag, lab = pool[(v, t)]
+    fam, seeds, ep, batch = adaptive["family"], adaptive["seeds"], int(adaptive["epochs"]), int(adaptive["batch"])
+    sel["chosen"] = {"run_id": best["run_id"], "variant": v, "transfer": t, "label": lab, "val_AP": float(best["val_AP"])}
+    out: List[RunSpec] = []
+
+    def add(tier, variant, transfer, tg, group, seed, imgsz=640, e=None, eval_sizes=(), notes=""):
+        out.append(RunSpec(run_id=run_id_for(fam, variant, tg, seed), group=group, family=fam, variant=variant, transfer=transfer, seed=seed, epochs=e or ep, imgsz=imgsz,
+                           floor=16, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
+    for imgsz, e in adaptive["finals"]:
+        add(7, v, t, f"f{imgsz}e{e}", f"{lab}, {imgsz} px, {e} epochs", seeds[0], imgsz=imgsz, e=e, eval_sizes=bigger_eval_sizes(imgsz), notes="search: final")
+    for imgsz, e in adaptive["finals"]:
+        add(7, "base", "role", f"f{imgsz}e{e}", f"{SEARCH_POOL[0][3]}, {imgsz} px, {e} epochs", seeds[0], imgsz=imgsz, e=e, eval_sizes=bigger_eval_sizes(imgsz), notes="search: final")
+    for sd in seeds[1:]:
+        add(6, v, t, tag, lab, sd, notes="search: confirm")
+    if (v, t) != ("graft", "role"):
+        for sd in seeds[1:]:
+            add(6, "graft", "role", "f16", "P2-Graft", sd, notes="search: reference")
+    out = [x for x in out if not (Path(work) / "runs" / x.run_id / "result.json").exists()]
+    jdump(sel, Path(work) / "search_selection.json")
+    log(f"search: chosen {lab} ({best['run_id']}, val AP {float(best['val_AP']):.2f}); stage B/C: {[x.run_id for x in out]}", log_path)
+    return [asdict(x) for x in out], sel
+
+
+@app.function
+def leaderboard(work):
+    """One row per condition (variant, transfer, floor, input size, epochs): mean +- std over seeds, and the difference to the baseline trained with the same size and
+    schedule (paired by seed where the seeds agree).  Returns (DataFrame, markdown text)."""
+    import pandas as pd
+    df = collect_results(Path(work))
+    if df.empty:
+        return pd.DataFrame(), "(no finished runs yet)"
+    g = ["variant", "transfer", "floor", "imgsz", "epochs"]
+    cols = ["val_AP", "val_AP50", "val_APs", "val_AP_tiny", "test_AP", "test_AP50", "gflops", "params_deploy_M", "latency_ms", "train_h"]
+    rows = []
+    for key, d in df.groupby(g, dropna=False):
+        row = dict(zip(g, key))
+        row["label"] = str(d["group"].iloc[0])
+        row["n"] = len(d)
+        row["seeds"] = ",".join(str(int(x)) for x in sorted(d["seed"]))
+        for c in cols:
+            if c in d:
+                row[c] = float(d[c].mean())
+                row[c + "_std"] = float(d[c].std(ddof=1)) if len(d) > 1 else float("nan")
+        for sz in (800, 960, 1024):
+            c = f"val_AP_at{sz}"
+            if c in d and d[c].notna().any():
+                row[c] = float(d[c].mean())
+        rows.append(row)
+    lb = pd.DataFrame(rows)
+    for m in ("val_AP", "val_AP50", "test_AP", "test_AP50"):
+        lb["d_" + m] = float("nan")
+    for i, r in lb.iterrows():
+        b = df[(df.variant == "base") & (df.transfer == "role") & (df.floor == r["floor"]) & (df.imgsz == r["imgsz"]) & (df.epochs == r["epochs"])]
+        d = df[(df.variant == r["variant"]) & (df.transfer == r["transfer"]) & (df.floor == r["floor"]) & (df.imgsz == r["imgsz"]) & (df.epochs == r["epochs"])]
+        if b.empty:
+            continue
+        for m in ("val_AP", "val_AP50", "test_AP", "test_AP50"):
+            if m not in d or m not in b:
+                continue
+            common = sorted(set(b["seed"]) & set(d["seed"]))
+            if common:
+                lb.loc[i, "d_" + m] = float(np.mean([float(d[d.seed == s_][m].iloc[0]) - float(b[b.seed == s_][m].iloc[0]) for s_ in common]))
+            else:
+                lb.loc[i, "d_" + m] = float(d[m].mean() - b[m].mean())
+    lb = lb.sort_values(["imgsz", "epochs", "val_AP"], ascending=[True, True, False]).reset_index(drop=True)
+    head = ["label", "imgsz", "epochs", "n", "val AP", "d val", "val AP50", "test AP", "d test", "test AP50", "GFLOPs", "params M", "ms"]
+    md = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
+    pm = lambda r, c: (f"{r[c]:.2f}" + (f"±{r[c + '_std']:.2f}" if isnum(r.get(c + "_std")) else "")) if isnum(r.get(c)) else "-"
+    sg = lambda x: f"{x:+.2f}" if isnum(x) else "-"
+    for _, r in lb.iterrows():
+        md.append("| " + " | ".join([r["label"], str(int(r["imgsz"])), str(int(r["epochs"])), str(int(r["n"])), pm(r, "val_AP"), sg(r["d_val_AP"]), pm(r, "val_AP50"), pm(r, "test_AP"),
+                                      sg(r["d_test_AP"]), pm(r, "test_AP50"), f"{r['gflops']:.1f}" if isnum(r.get("gflops")) else "-",
+                                      f"{r['params_deploy_M']:.2f}" if isnum(r.get("params_deploy_M")) else "-", f"{r['latency_ms']:.2f}" if isnum(r.get("latency_ms")) else "-"]) + " |")
+    return lb, "\n".join(md)
+
+
+@app.function
+def write_leaderboard(work):
+    """Leaderboard files for the downloads (CSV + Markdown) and the table of results so far."""
+    work = Path(work)
+    lb, md = leaderboard(work)
+    out = work / "results"
+    out.mkdir(parents=True, exist_ok=True)
+    if len(lb):
+        lb.to_csv(out / "leaderboard.csv", index=False)
+    (out / "leaderboard.md").write_text(md + "\n", encoding="utf-8")
+    try:
+        collect_results(work).to_csv(out / "all_runs.csv", index=False)
+    except Exception:
+        pass
+    return md
+
+
+@app.function
 def cost_factor(spec):
     """Relative training cost of a run (pixels dominate: data loading + activations)."""
-    return (spec.imgsz / 640.0) ** 2 * (1.12 if spec.variant in ("graft", "naive", "replace") else 1.0)
+    f = {"graft": 1.12, "graftd": 1.15, "naive": 1.12, "replace": 1.12}.get(spec.variant)
+    if f is None:
+        f = 1.06 if spec.variant.startswith("inj") else (1.12 if spec.variant.startswith("assist") else 1.0)
+    return (spec.imgsz / 640.0) ** 2 * f
 
 
 @app.function
@@ -1555,7 +1806,7 @@ def estimate_gpu_gb(spec):
     """GPU memory one training process occupies (the figure Ultralytics reports), from the first real run on the RTX PRO 6000 at batch 32 and 640 px:
     17.5 GB for the baseline, 32-37 GB for the four-level models (the task-aligned assigner of dense VisDrone batches dominates); the baseline at 896 px
     used 24-26 GB, so the size factor is 1 + 0.45 * (imgsz - 640) / 256.  Used only to stop the scheduler from starting a run that cannot fit next to the running ones."""
-    gb = 17.5 if spec.variant == "base" else 37.0
+    gb = 17.5 if spec.variant == "base" else (19.0 if spec.variant.startswith("inj") else (25.0 if spec.variant.startswith("assist") else 37.0))
     gb *= 1.0 + 0.45 * (spec.imgsz - 640) / 256.0
     return gb * max(0.5, min(1.0, spec.batch / 32.0))
 
@@ -1743,9 +1994,11 @@ def worker_main(plan_path):
     log(f"worker started: {len(queue)} runs queued, {n_par} parallel, deadline in {fmt_hours(deadline - time.time())}", lp)
     oom_retried: set = set()
     waiting_logged: set = set()
+    adaptive = plan.get("adaptive")
+    hook_pending = bool(adaptive)
     stagger_s = float(plan.get("stagger_s", 60.0))
     last_start = 0.0
-    while queue or running:
+    while queue or running or hook_pending:
         # reap finished children
         for rid, (proc, spec, t0) in list(running.items()):
             rc = proc.poll()
@@ -1768,9 +2021,25 @@ def worker_main(plan_path):
                     ratio = 0.7 * ratio + 0.3 * ((time.time() - t0) / max(est, 1.0))
                 log(f"run {rid} finished (ok={ok}, {fmt_hours(time.time() - t0)}), runtime ratio now {ratio:.2f}", lp)
                 del running[rid]
+                try:  # results so far, readable from outside at any time
+                    write_leaderboard(work)
+                except Exception as e:
+                    log(f"leaderboard failed: {e!r}", lp)
             elif time.time() > hard_deadline:
                 proc.terminate()
                 status[rid].update(state="killed (hard deadline)")
+        if hook_pending and all(status[i]["state"] not in ("queued", "running") for i in adaptive["explore_ids"] if i in status):
+            hook_pending = False  # stage A is complete (done, failed or skipped): choose the candidate and queue stages B and C
+            try:
+                new_specs, _sel = search_extend(work, adaptive, lp)
+            except Exception as e:
+                new_specs = []
+                log(f"search_extend failed: {e!r}\n{traceback.format_exc()}", lp)
+            fresh = [spec_from_dict(d) for d in new_specs]
+            for sp in fresh:
+                status[sp.run_id] = {"state": "queued", "tier": sp.tier, "group": sp.group}
+            queue[0:0] = fresh
+            write_status()
         # start new children if time allows (staggered: simultaneous starters would race on shared downloads and caches)
         while queue and len(running) < n_par:
             if time.time() - last_start < stagger_s:
@@ -1805,6 +2074,15 @@ def worker_main(plan_path):
         time.sleep(5)
     write_status()
     log("worker finished", lp)
+    if adaptive:
+        try:
+            log("\n" + write_leaderboard(work), lp)
+            log(f"remeasured latency of {remeasure_latency(work, lp)} runs", lp)
+            write_leaderboard(work)
+            log(f"diagnostics zip: {zip_diagnostics(work)}", lp)
+        except Exception as e:
+            log(f"final leaderboard/zip failed: {e!r}", lp)
+        return
     if not plan.get("limit"):
         try:
             log(f"sequential latency re-measurement: {remeasure_latency(work, lp)} runs", lp)
@@ -3969,22 +4247,29 @@ def smoke_test(work, limit=48, size=320, device=None):
             steps.append({"step": name, "ok": False, "seconds": round(time.time() - t0, 1), "detail": repr(e) + "\n" + traceback.format_exc()[-600:]})
 
     step("environment", lambda: {k: env_info().get(k) for k in ("python", "torch", "ultralytics", "cuda_available", "gpu")})
-    step("exactness of the graft (random inputs, real COCO checkpoint)", lambda: {v: {"max_feature_diff": r["max_abs_feature_diff"],
-                                                                                    "max_head_diff": r["max_abs_head_output_diff"]} for v, r in exactness_report(work).items()})
+    def exact():
+        reps = exactness_report(work, variants=("graft", "replace", "graftd", "inj16", "assist32"), modes={"graftd": "role_ws"})
+        reps["graft+warm-start"] = exactness_report(work, variants=("graft",), modes={"graft": "role_ws"})["graft"]
+        bad = [v for v, r in reps.items() if r["max_abs_feature_diff"] > 1e-4 or r["max_abs_head_output_diff"] > 1e-4]
+        if bad:
+            raise RuntimeError(f"variants that do NOT reproduce the pretrained detector at initialisation: {bad}")
+        return {v: {"max_feature_diff": r["max_abs_feature_diff"], "max_head_diff": r["max_abs_head_output_diff"]} for v, r in reps.items()}
+    step("exactness of the grafted / injected variants (random inputs, real COCO checkpoint)", exact)
     for sp in ("train", "val"):
         step(f"prepare {sp} subset ({limit} images @ {size}px)", lambda sp=sp: bool(prepare_split(work, sp, sizes=(size,), limit=limit)))
     results = {}
-    for variant in ("base", "graft"):
-        spec = RunSpec(run_id=f"smoke-{variant}", group=variant, variant=variant, epochs=1, imgsz=size, batch=8, seed=0)
+    for variant, transfer in (("base", "role"), ("graft", "role"), ("graft", "role_ws"), ("inj16", "role"), ("assist32", "role"), ("graftd", "role_ws")):
+        variant_key = variant if transfer == "role" else f"{variant}-{transfer}"
+        spec = RunSpec(run_id=f"smoke-{variant_key}", group=variant_key, variant=variant, transfer=transfer, epochs=1, imgsz=size, batch=8, seed=0)
 
         def go(spec=spec):
             shutil.rmtree(work / "runs" / spec.run_id, ignore_errors=True)
             ok = run_one(str(work), asdict(spec), workers=0, cache=False, device=device, data_suffix=f"_lim{limit}", limit=limit, tide=True, test_dev=False)
             r = jload(work / "runs" / spec.run_id / "result.json", {})
-            results[variant] = r
+            results[variant_key] = r
             m = r.get("metrics", {}).get(f"val|{size}|o2o|std", {})
             return {"run_one_ok": ok, "AP50": m.get("AP50"), "n_dets": m.get("n_dets"), "tide_ok": "main" in (r.get("tide|val") or {})}
-        step(f"train + evaluate {variant} (1 epoch, tiny)", go)
+        step(f"train + evaluate {variant_key} (1 epoch, tiny)", go)
 
     def selftest():
         return evaluator_selftest(work / "data" / f"gt_val_lim{limit}.json")
@@ -4244,7 +4529,7 @@ def install_cuda_torch(backend="cu128", dry_run=False, log=print):
 
 
 @app.function
-def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, paper=None, notebook_file=None):
+def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, paper=None, notebook_file=None, adaptive=None):
     """The dict that worker_main() consumes (shared by the numbered step ⑦ and the autopilot)."""
     now = time.time()
     plan = {"work": str(work), "specs": [asdict(s) for s in specs], "n_parallel": par["n_parallel"], "workers": par["workers"], "cache": cache, "device": None,
@@ -4254,12 +4539,15 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
         plan.update(limit=limit, data_suffix=f"_lim{limit}")
     if notebook_file:
         plan["notebook_file"] = str(notebook_file)
+    if adaptive:  # improvement search: the worker extends the queue after stage A and writes a leaderboard instead of a paper
+        plan.update(adaptive=adaptive, auto_paper=False)
     return plan
 
 
 @app.function
 def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, iso_size=896, families=("v10", "yolo26"), notebook_file=None,
-              skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None, template="lncs", bootstrap=300, log_path=None, launch=True, recalibrate=False):
+              skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None, template="lncs", bootstrap=300, log_path=None, launch=True, recalibrate=False,
+              search=False, finals=None):
     """Everything between an EMPTY work directory and a RUNNING training worker (notebook steps ②-⑦), in one call.  Idempotent: finished parts are skipped.
     `limit` runs the whole thing on a tiny subset of the data (test mode: no analyses, no calibration, no automatic paper).
     Returns {"ok": bool, "steps": [{step, ok, seconds, detail}], "plan": dict | None, "pid": int | None}."""
@@ -4351,8 +4639,17 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
     elif limit is None:
         spe = float((jload(work / "calibration.json", {}) or {}).get("s_per_epoch", 60.0))
     seeds, tiers = tuple(seeds), tuple(tiers)
-    template_specs = make_plan(40, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
-    if epochs:
+    adaptive = None
+    if search:
+        n_ep = int(epochs) if epochs else ROUND1_EPOCHS
+        finals = [tuple(f) for f in finals] if finals else fit_finals(budget_h, n_seeds=len(seeds), epochs=n_ep)
+        specs, adaptive = make_search_plan(n_ep, seeds=seeds, family="v10", finals=finals)
+        template_specs = specs
+    else:
+        template_specs = make_plan(40, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
+    if search:
+        pass
+    elif epochs:
         n_ep = int(epochs)
     elif limit is not None:
         n_ep = 1
@@ -4360,14 +4657,18 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         n_ep = ROUND1_EPOCHS
     else:
         n_ep, _ = choose_epochs(budget_h * 3600, template_specs, spe, tiers=tuple(t for t in tiers if t <= 1) or (0,))
-    specs = make_plan(n_ep, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
+    if not search:
+        specs = make_plan(n_ep, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
     if limit is not None:
         specs = [dataclasses.replace(s, batch=8, imgsz=min(s.imgsz, 320), eval_sizes=()) for s in specs]
     cache = choose_cache(par["n_parallel"], need_gb=9.0 * (max(s.imgsz for s in specs) / 640.0) ** 2)
-    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb,
+    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb, adaptive=adaptive,
                             paper={"B": int(bootstrap), "iso_size": int(iso_size), "template": template})
     jdump(plan, work / "plan_preview.json")
     summary = f"{len(specs)} runs x {n_ep} epochs, {spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}"
+    if search:
+        summary = (f"improvement search: {len(SEARCH_POOL)} candidates x {n_ep} epochs, then the best one with more seeds and long runs {finals}; "
+                   f"{spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}")
     steps.append({"step": "plan", "ok": True, "seconds": 0.0, "detail": summary})
 
     def shared_inputs():
@@ -4405,7 +4706,8 @@ def zip_diagnostics(work, out_zip=None, include_predictions=False, max_log_bytes
     sources).  Predictions (hundreds of MB) only if asked."""
     work = Path(work)
     out_zip = Path(out_zip) if out_zip else work / "diagnostics.zip"
-    files = [work / n for n in ("status.json", "worker.json", "plan.json", "plan_preview.json", "calibration.json")]
+    files = [work / n for n in ("status.json", "worker.json", "plan.json", "plan_preview.json", "calibration.json", "search_selection.json")]
+    files += sorted((work / "results").glob("*"))
     files += sorted((work / "analysis").glob("*.json")) + sorted((work / "paper").glob("*.csv")) + sorted((work / "paper").glob("*.json")) + sorted((work / "paper").glob("*.tex"))
     for pat in ("result.json", "train_info.json", "results.csv", "args.yaml", "state.json", "external_*.json"):
         files += sorted((work / "runs").glob(f"*/{pat}"))
@@ -4466,16 +4768,20 @@ def _(mo):
     work_input = mo.ui.text(value=str(default_work_dir()), label="Work directory (data, runs, results, paper)", full_width=True)
     budget_h = mo.ui.slider(2.0, 10.0, value=9.0, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
     seeds_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "1", "2"], label="Seeds of the main contrast")
+    mode_ui = mo.ui.dropdown(options={"Round 3 - improvement search: new architectures, pick the best, confirm, train long (recommended)": "search",
+                                      "Round 2 - extensions H5-H7 of the study (tiers below)": "tiers",
+                                      "Round 1 / custom - tiers below": "tiers"},
+                             value="Round 3 - improvement search: new architectures, pick the best, confirm, train long (recommended)", label="What to run", full_width=True)
     tiers_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "4"],
-                                 label="Run tiers. ROUND 2 (default, extensions H5-H7) = 0 + 4: headline pair x seeds, then 70-epoch pair, key-matched graft, base and graft at 896 px. "
+                                 label="Run tiers (only for Round 1/2). ROUND 2 = 0 + 4: headline pair x seeds, then 70-epoch pair, key-matched graft, base and graft at 896 px. "
                                        "ROUND 1 (main study H1-H4) = 0 + 1 + 2: one seed of compute-matched, naive, classic-TAL, P5-removal, random-init, then more seeds. 3 = YOLO26 family")
-    epochs_ui = mo.ui.number(0, 300, step=5, value=0, label="Epochs per run (0 = 35 in round 2, otherwise chosen from the budget)")
+    epochs_ui = mo.ui.number(0, 300, step=5, value=0, label="Epochs per run (0 = 35: the search's short schedule and round 2; round 1 chooses from the budget)")
     iso_ui = mo.ui.dropdown(options=["800", "896", "960"], value="896", label="Compute-matched resolution baseline (px)")
     boot_ui = mo.ui.slider(50, 1000, value=300, step=50, label="Bootstrap resamples", show_value=True)
     template_ui = mo.ui.dropdown(options=["lncs", "article"], value="lncs",
                                  label="Paper template (lncs = Springer LNCS, the ICPR/ICPRv format; article = self-contained two-column article)")
-    mo.vstack([mo.md("## ① Settings"), work_input, budget_h, mo.hstack([seeds_ui, tiers_ui], justify="start"), mo.hstack([epochs_ui, iso_ui, boot_ui], justify="start"), template_ui])
-    return boot_ui, budget_h, epochs_ui, iso_ui, seeds_ui, template_ui, tiers_ui, work_input
+    mo.vstack([mo.md("## ① Settings"), work_input, mode_ui, budget_h, mo.hstack([seeds_ui, tiers_ui], justify="start"), mo.hstack([epochs_ui, iso_ui, boot_ui], justify="start"), template_ui])
+    return boot_ui, budget_h, epochs_ui, iso_ui, mode_ui, seeds_ui, template_ui, tiers_ui, work_input
 
 
 @app.cell
@@ -4539,12 +4845,12 @@ def _(PROBE, fix_btn, mo):
 
 
 @app.cell
-def _(WORK, auto_btn, auto_ok, boot_ui, budget_h, epochs_ui, iso_ui, mo, seeds_ui, template_ui, tiers_ui):
+def _(WORK, auto_btn, auto_ok, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui, seeds_ui, template_ui, tiers_ui):
     mo.stop(not (auto_ok.value or auto_btn.value), mo.md("*Autopilot not started. Tick the box and press the button — or use the numbered steps below.*"))
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_study.py")
     AUTO = autopilot(WORK, budget_h=float(budget_h.value), seeds=tuple(int(s) for s in seeds_ui.value) or (0, 1, 2), tiers=tuple(int(t) for t in tiers_ui.value) or (0, 1),
                      epochs=int(epochs_ui.value or 0), iso_size=int(iso_ui.value), notebook_file=str(_nb), template=template_ui.value, bootstrap=int(boot_ui.value),
-                     log_path=WORK / "logs" / "autopilot.log")
+                     search=(mode_ui.value == "search"), log_path=WORK / "logs" / "autopilot.log")
     _lines = [f"- {'✅' if s['ok'] else '❌'} **{s['step']}** ({s['seconds']} s): `{str(s['detail'])[:600]}`" for s in AUTO["steps"]]
     mo.vstack([mo.callout(mo.md("**Autopilot finished: the worker is running — follow it in ⑧.**" if AUTO["ok"] else "**Autopilot stopped at a failed step** — read the last line, fix it, press the button again."),
                           kind="success" if AUTO["ok"] else "danger"), mo.md("\n".join(_lines))])
@@ -4657,15 +4963,20 @@ def _(PAR, WORK, calib_btn, mo):
 
 
 @app.cell
-def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, seeds_ui, tiers_ui):
+def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui, seeds_ui, tiers_ui):
     _seeds = tuple(int(s) for s in seeds_ui.value) or (0, 1, 2)
     _tiers = tuple(int(t) for t in tiers_ui.value) or (0, 1)
     _spe = float(CALIB.get("s_per_epoch", float("nan"))) if CALIB else float("nan")
     _spe = _spe if _spe == _spe else (jload(WORK / "calibration.json", {}) or {}).get("s_per_epoch", 60.0)
-    _template = make_plan(40, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
-    _auto, _info = choose_epochs(budget_h.value * 3600, _template, _spe, tiers=tuple(t for t in _tiers if t <= 1) or (0,))
-    EPOCHS = int(epochs_ui.value) if epochs_ui.value else (ROUND1_EPOCHS if 4 in _tiers else _auto)
-    PLAN = make_plan(EPOCHS, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
+    if mode_ui.value == "search":
+        EPOCHS = int(epochs_ui.value) if epochs_ui.value else ROUND1_EPOCHS
+        PLAN, ADAPT = make_search_plan(EPOCHS, seeds=_seeds, finals=fit_finals(float(budget_h.value), n_seeds=len(_seeds), epochs=EPOCHS))
+    else:
+        ADAPT = None
+        _template = make_plan(40, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
+        _auto, _info = choose_epochs(budget_h.value * 3600, _template, _spe, tiers=tuple(t for t in _tiers if t <= 1) or (0,))
+        EPOCHS = int(epochs_ui.value) if epochs_ui.value else (ROUND1_EPOCHS if 4 in _tiers else _auto)
+        PLAN = make_plan(EPOCHS, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
     _tot = sum(estimate_run_seconds(s, _spe) for s in PLAN)
     _tab = pd.DataFrame([{"order": i + 1, "run": s.run_id, "tier": s.tier, "imgsz": s.imgsz, "epochs": s.epochs, "est. hours": round(estimate_run_seconds(s, _spe) / 3600, 2)}
                          for i, s in enumerate(PLAN)])
@@ -4673,7 +4984,7 @@ def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, seeds_ui, tier
                      f"({_tot / 3600 / PAR['n_parallel']:.1f} h wall-clock with {PAR['n_parallel']} parallel process(es)); budget {budget_h.value:.1f} h. "
                      "Runs that cannot finish inside the budget are skipped from the end of the queue."),
                mo.ui.table(_tab, selection=None, page_size=25)])
-    return EPOCHS, PLAN
+    return ADAPT, EPOCHS, PLAN
 
 
 @app.cell
@@ -4685,7 +4996,7 @@ def _(mo):
 
 
 @app.cell
-def _(CALIB, PAR, PLAN, WORK, boot_ui, budget_h, confirm, iso_ui, launch_btn, mo, template_ui):
+def _(ADAPT, CALIB, PAR, PLAN, WORK, boot_ui, budget_h, confirm, iso_ui, launch_btn, mo, template_ui):
     mo.stop(not (launch_btn.value and confirm.value), mo.md("*Tick the box and press the button to launch. Nothing is running yet.*"))
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_study.py")
     _w = jload(WORK / "worker.json", {})
@@ -4696,7 +5007,7 @@ def _(CALIB, PAR, PLAN, WORK, boot_ui, budget_h, confirm, iso_ui, launch_btn, mo
         mo.stop(True, mo.callout(mo.md(f"Training processes from an earlier worker are still alive: {_strays}. Wait for them to finish (or stop them) before launching."), kind="danger"))
     _cache = choose_cache(PAR["n_parallel"], need_gb=9.0 * (max(sp_.imgsz for sp_ in PLAN) / 640.0) ** 2)
     _plan = make_worker_plan(WORK, PLAN, PAR, _cache, float(budget_h.value), float((CALIB or jload(WORK / "calibration.json", {})).get("s_per_epoch", 60.0)),
-                             paper={"B": int(boot_ui.value), "iso_size": int(iso_ui.value), "template": template_ui.value})
+                             paper={"B": int(boot_ui.value), "iso_size": int(iso_ui.value), "template": template_ui.value}, adaptive=ADAPT)
     PID = launch_worker(WORK, _plan, notebook_file=str(_nb))
     mo.callout(mo.md(f"Worker started (pid **{PID}**, cache={_cache}). It keeps running if you close this tab (but see the molab note at the top). Progress: step ⑧."), kind="success")
     return (PID,)
@@ -4738,7 +5049,12 @@ def _(WORK, mo, refresh):
         mo.stop(True, mo.md("*No finished run yet.*"))
     _cols = [c for c in ("run_id", "val_AP50", "val_AP", "val_APs", "test_AP", "gflops", "latency_ms", "train_h") if c in _df.columns]
     _csv = _df.drop(columns=[c for c in _df.columns if c.endswith("_perclass_AP50") or c.endswith("_perclass_AP")], errors="ignore").to_csv(index=False).encode("utf-8")
-    mo.vstack([mo.md("### Finished runs so far (VisDrone-val unless noted)"), mo.ui.table(_df[_cols].round(2), selection=None, page_size=30),
+    _lb, _md = leaderboard(WORK)
+    _sel = jload(WORK / "search_selection.json", {})
+    _pick = (f"**Search: chosen candidate = {_sel['chosen']['label']}** (validation AP {_sel['chosen']['val_AP']:.2f} at the short schedule; chosen on validation only)"
+             if _sel.get("chosen") else "")
+    mo.vstack([mo.md("### Leaderboard (VisDrone-val and test-dev AP; `d` = difference to the baseline with the same input size and schedule)"), mo.md(_pick), mo.md(_md),
+               mo.accordion({"all finished runs, one row per run": mo.ui.table(_df[_cols].round(2), selection=None, page_size=30)}),
                mo.download(data=_csv, filename="all_runs_so_far.csv", mimetype="text/csv", label="Download the results so far (CSV, small) — a cheap backup")])
     return
 
@@ -4825,6 +5141,13 @@ def _(WORK, mo, refresh):
     refresh  # re-read the disk periodically: the worker builds the paper by itself when it finishes
     _zip = WORK / "paper_bundle.zip"
     _tex = WORK / "paper" / "main.tex"
+    _dz = WORK / "diagnostics.zip"
+    if not (_zip.exists() and _tex.exists()) and _dz.exists():
+        _lbm = (WORK / "results" / "leaderboard.md")
+        mo.stop(True, mo.vstack([mo.md("## ⑩ Download\nThe improvement search is finished: **download `diagnostics.zip`** (results/leaderboard.csv, all_runs.csv, every run's result.json, selection, logs). "
+                                       "No paper is built in this mode."),
+                                 mo.download(data=_dz.read_bytes(), filename="diagnostics.zip", mimetype="application/zip", label="Download diagnostics.zip (results of the search)"),
+                                 mo.download(data=_lbm.read_bytes(), filename="leaderboard.md", mimetype="text/markdown", label="Download leaderboard.md") if _lbm.exists() else mo.md("")]))
     if not (_zip.exists() and _tex.exists()):
         mo.stop(True, mo.md("## ⑩ Download\n*No paper bundle yet — the worker builds it when it finishes; ⑨ builds it from the runs finished so far.*"))
     mo.vstack([mo.md("## ⑩ Download"),

@@ -1,13 +1,18 @@
 # P2-Graft — one marimo notebook for a controlled small-object study (YOLOv10n × VisDrone)
 
-> **START HERE (molab, RTX PRO 6000, 12 h)** — the defaults now run **ROUND 2** (extensions H5–H7, ≈ 9.6 h in total)
+> **START HERE (molab, RTX PRO 6000, 12 h) — ROUND 3: improvement search (the default)**
 > 1. molab → new notebook → paste `https://github.com/Mudassiruddin7/YOLO/blob/main/graft_p2_study.py` → notebook-specs button → **toggle the GPU**.
-> 2. Press **Run all** and leave the tab open and the computer awake. Nothing else has to be clicked: environment, data, analyses, smoke test, calibration, training and the paper build run one after the other.
-> 3. When ⑧ says the worker has finished and the paper is written, **download ⑩ (`paper_bundle.zip`) and ⑩b (`diagnostics.zip`) before the session ends** — molab deletes everything else.
+> 2. Press **Run all** and keep the tab open and the computer awake. Nothing else has to be clicked. ≈ 8 h of training in a 12 h session.
+> 3. When ⑧ says the worker has finished, **download `diagnostics.zip` from ⑩** (it contains `results/leaderboard.csv`, `all_runs.csv`, `search_selection.json`, every run's `result.json`, logs) before the session ends.
 >
-> **Round 1** (main study, H1–H4: tiers 0+1+2, budget 8.5 h) is finished; its results are summarised below. To repeat it, set *Run tiers* to 0, 1, 2 and the budget to 8.5 in cell ① before pressing Run all.
+> **What round 3 does** (all candidates start *exactly* at the pretrained YOLOv10n, all use the identical recipe):
+> * **Stage A** (one seed, 35 epochs, 640 px): baseline, P2-Graft, P2-Graft with a *warm-started* new level (initialised from the pretrained P3 level instead of at random),
+>   a twice as deep warm-started graft, *detail injection* (the P3 head additionally sees a strided conv of the stride-4 backbone feature, +4 % GFLOPs) and *P2-assisted P3* (the stride-4 neck block is folded into the P3 head, no stride-4 level).
+> * The candidate with the best **validation** AP is selected automatically (test-dev is never used for any decision).
+> * **Stage B**: seeds 1 and 2 of the baseline, of the selected candidate and of plain P2-Graft.
+> * **Stage C**: baseline and selected candidate trained long (≈ 90 epochs, fitted to the budget) at 640 px and at 896 px, each also tested at a larger size. Same-epoch pairs give (i) the standard-resolution comparison, (ii) the best absolute result, and (iii) the compute-matched comparison (candidate at 640 px vs baseline at 896 px, ≈ equal GFLOPs).
 >
-> Details, molab facts and troubleshooting are below.
+> Older modes (round 1 = main study H1–H4, round 2 = extensions H5–H7) are still available in cell ① (*What to run*). Details, molab facts and troubleshooting are below.
 
 ### Round 1 — results (molab, RTX PRO 6000, 23 runs, 35 epochs, VisDrone-val, mean over 3 seeds unless stated)
 
