@@ -912,6 +912,30 @@ def gpu_total_gb():
 
 
 @app.function
+def remeasure_latency(work, log_path=None):
+    """Re-measure the latency of every finished run ONE AT A TIME.  The measurement taken at the end of a run happens while other training processes share
+    the GPU and the CPU (a first real run showed 3.6-6.2 ms for models of the same architecture), so it is replaced by this sequential pass."""
+    import torch
+    n = 0
+    for rf in sorted((Path(work) / "runs").glob("*/result.json")):
+        r = jload(rf)
+        if not r or not r.get("finished_at") or not r.get("spec"):
+            continue
+        w = rf.parent / "weights" / "last.pt"
+        if not w.exists() or not torch.cuda.is_available():
+            continue
+        try:
+            r["latency_concurrent"] = r.get("latency")
+            r["latency"] = {**latency_benchmark(w, int(r["spec"]["imgsz"]), iters=300), "sequential": True}
+            jdump(r, rf)
+            n += 1
+        except Exception as e:
+            log(f"latency re-measurement failed for {rf.parent.name}: {e!r}", log_path)
+        release_gpu_memory()
+    return n
+
+
+@app.function
 def parallel_plan(cpu_count=None, gpu_gb=None):
     """How many training processes to run side by side and how many data-loader workers each gets.
 
@@ -1748,6 +1772,11 @@ def worker_main(plan_path):
         time.sleep(5)
     write_status()
     log("worker finished", lp)
+    if not plan.get("limit"):
+        try:
+            log(f"sequential latency re-measurement: {remeasure_latency(work, lp)} runs", lp)
+        except Exception as e:
+            log(f"latency re-measurement failed: {e!r}", lp)
     if plan.get("auto_paper", True) and not plan.get("limit"):
         # build the paper now: the user may be away, and nothing but uploaded files survives a molab shutdown, so the bundle should be ready to download
         try:
@@ -1802,6 +1831,7 @@ def flatten_result(r):
     row["gflops"] = ms.get("gflops_deploy")
     lat = r.get("latency") or {}
     row["latency_ms"] = lat.get("latency_ms_median")
+    row["latency_seq"] = bool(lat.get("sequential", False))
     tr = r.get("train") or {}
     row["train_h"] = (tr.get("wall_s") or float("nan")) / 3600.0
     tf = tr.get("transfer") or {}
@@ -3210,9 +3240,14 @@ def render_paper_tex(ctx):
         "The schedule is deliberately short (the budget of one GPU session); absolute numbers are therefore lower than 300-epoch results reported in the literature and must not be compared with them.")
     gpu = env.get("gpu", "an NVIDIA GPU")
     odd_batch = sorted(f"{r} (batch {int(b)})" for r, b in zip(A["df"]["run_id"], A["df"]["batch"]) if int(b) not in (32, -1)) if "batch" in A["df"] else []
+    lat_seq = bool("latency_seq" in A["df"] and len(A["df"]) and A["df"]["latency_seq"].fillna(False).astype(bool).all())
+    lat_txt = ("Latency is the median of 300 batch-1 forward passes of the fused deploy graph in FP16, measured for one model at a time after all training had finished."
+               if lat_seq else
+               "Latency is the median of 200 batch-1 forward passes of the fused deploy graph in FP16, measured at the end of each run while other trainings shared the GPU and the CPU, "
+               "so differences of about a millisecond between models are noise.")
     out.append(
         f"\\textbf{{Hardware and software.}} {tex_escape(gpu)}, PyTorch {tex_escape(env.get('torch', '--'))}, Ultralytics {tex_escape(env.get('ultralytics', ULTRALYTICS_PIN))}, "
-        f"{env.get('cpu_count', '--')} CPU threads. Latency is the median of 200 batch-1 forward passes of the fused deploy graph in FP16."
+        f"{env.get('cpu_count', '--')} CPU threads. " + lat_txt
         + (" After a CUDA out-of-memory error the following runs were repeated with a smaller batch (nominal batch 64 kept by gradient accumulation): "
            + tex_escape(", ".join(odd_batch)) + "." if odd_batch else ""))
     out.append(
@@ -3377,12 +3412,17 @@ def render_paper_tex(ctx):
         "excludes zero \\emph{and}, with several paired seeds, the same sign in every pair; everything else is ``inconclusive''. "
         "Single-seed verdicts say so, because image-level intervals capture test-set sampling, not training variance. "
         "All verdicts describe this model scale, dataset and schedule.")
+    out.append(
+        "\\textbf{Context for the resolution comparison.} Most VisDrone images are $960\\times540$ px, so a 640\\,px input down-scales them by a factor of 1.5 whereas 896\\,px is close to native resolution; "
+        "part of what a stride-4 level recovers at 640\\,px is detail that a larger input does not discard in the first place. "
+        "Likewise, the naive re-wiring differs from P2-Graft both in architecture and in the share of inherited weights; "
+        "a graft initialised by key matching, which would separate the two, was not trained here.")
     ext_note = ("the only evaluation outside VisDrone is the mapped-class zero-shot check above, which is not a cross-dataset study. " if A.get("external")
                 else "no cross-dataset evaluation is performed. ")
     out.append(
         "\\textbf{Limitations.} (i) Short fine-tuning budget ("
         f"{E} epochs); the new level starts from random weights, so a longer schedule may favour it more than reported here. (ii) One training dataset (VisDrone) and one detector scale (nano); "
-        "a second detector family (YOLO26n), if it was run, appears only in the run table of Appendix~\\ref{app:runs}, and " + ext_note +
+        + ("a second detector family (YOLO26n) appears only in the run table of Appendix~\\ref{app:runs}, and " if (A["df"]["family"] != "v10").any() else "") + ext_note +
         "(iii) Controls other than the main pair are single-seed unless Table~\\ref{tab:main} lists more. (iv) The window floor is a property of the Ultralytics release used; other frameworks differ. "
         "(v) Latency is measured on one GPU, not on embedded hardware. (vi) The main protocol follows the YOLO literature (no ignore-region rule); the ignore-region variant is reported. "
         "(vii) No state-of-the-art claim is made.")
