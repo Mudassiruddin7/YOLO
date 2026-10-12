@@ -1,12 +1,38 @@
 # P2-Graft — one marimo notebook for a controlled small-object study (YOLOv10n × VisDrone)
 
-> **START HERE (molab, RTX PRO 6000, 12 h)**
-> 1. Put **only `graft_p2_study.py`** in a GitHub repository; in molab paste its GitHub URL in the new-notebook dropdown; click the notebook-specs button and **toggle the GPU**.
-> 2. Cell ① (defaults), cell ② (if it offers *Fix automatically*, press it, then *Re-check*), then cell ⓪ **Autopilot** (tick the box, press the button; ≈ 45–60 min until the training starts).
-> 3. Keep the tab open and the computer awake; watch ⑧. When the training budget (8.5 h by default) is used up, the worker builds the paper by itself (≈ 0.5 h).
-> 4. **Download ⑩ (paper bundle) and ⑩b (diagnostics) before the session ends** — molab deletes everything else — and send me both files.
+> **START HERE (molab, RTX PRO 6000, 12 h)** — the defaults now run **ROUND 2** (extensions H5–H7, ≈ 9.6 h in total)
+> 1. molab → new notebook → paste `https://github.com/Mudassiruddin7/YOLO/blob/main/graft_p2_study.py` → notebook-specs button → **toggle the GPU**.
+> 2. Press **Run all** and leave the tab open and the computer awake. Nothing else has to be clicked: environment, data, analyses, smoke test, calibration, training and the paper build run one after the other.
+> 3. When ⑧ says the worker has finished and the paper is written, **download ⑩ (`paper_bundle.zip`) and ⑩b (`diagnostics.zip`) before the session ends** — molab deletes everything else.
+>
+> **Round 1** (main study, H1–H4: tiers 0+1+2, budget 8.5 h) is finished; its results are summarised below. To repeat it, set *Run tiers* to 0, 1, 2 and the budget to 8.5 in cell ① before pressing Run all.
 >
 > Details, molab facts and troubleshooting are below.
+
+### Round 1 — results (molab, RTX PRO 6000, 23 runs, 35 epochs, VisDrone-val, mean over 3 seeds unless stated)
+
+| model | AP | AP50 | AP_S | test-dev AP | GFLOPs | deploy params |
+|---|---|---|---|---|---|---|
+| YOLOv10n baseline | 16.22 ± 0.04 | 29.3 | 8.0 | 13.5 | 6.6 | 2.27 M |
+| **P2-Graft** | **17.15 ± 0.19** | 30.3 | 9.5 | 13.7 | 12.7 | 2.39 M |
+| naive P2 re-wiring | 15.89 | 28.4 | 8.8 | – | 10.7 | – |
+| P2 replaces P5 | 16.92 | 30.2 | 9.3 | 13.6 | 12.2 | 1.88 M |
+| baseline @ 896 px (≈ P2-Graft GFLOPs) | **21.65 ± 0.17** | 37.4 | 12.8 | 17.4 | 13.0 | 2.27 M |
+
+H1 supported (+0.93 AP, 95 % bootstrap interval [0.72, 1.17], every seed), H2 supported (graft +1.26 over re-wiring), H3 inconclusive (interaction +0.09 [−0.19, 0.37]),
+**H4 contradicted** (a higher-resolution baseline at equal GFLOPs is 4.5 AP *better* than P2-Graft). The earlier note that the paper's 23.99 AP came from confidence-truncated detections is
+reproduced here too: truncating at conf ≥ 0.25 turns AP50 29.3 → 20.0. Latency of round 1 was measured while three trainings shared the GPU and is therefore not interpretable (the notebook now re-measures it
+one model at a time); parameters and GFLOPs are exact. Absolute numbers are for a 35-epoch schedule and must not be compared with 300-epoch results from the literature.
+
+### Round 2 — what it adds (hypotheses added after seeing round 1, marked as such in the generated paper)
+
+| | question | runs |
+|---|---|---|
+| H5 | For the *same* architecture, is the role-based weight map better than key matching? (round 1 confounded architecture and transfer) | P2-Graft with key-matched transfer × 3 seeds |
+| H6 | Does the P2 level still help at the higher, compute-matched resolution (896 px)? | base@896 and graft@896, 3 seeds (the third seed is the first to be dropped if time runs short) |
+| H7 | Does the benefit of the level grow with a 2× longer schedule (70 epochs)? | base and graft, 70 epochs, 2 seeds |
+
+Round 2 also re-runs the headline pair (tier 0) in the new session: it is the paired reference for H5–H7 and a replication of H1.
 
 `graft_p2_study.py` is a single [marimo](https://marimo.io) notebook (plain `.py`, dependencies declared in its PEP 723 header).
 It contains the **entire study**: data download/conversion, the model variants, a background training scheduler, evaluation from
@@ -28,10 +54,11 @@ saved predictions, statistics, figures, and a generator that writes the LaTeX pa
 | H2 | Does the way pretrained weights are carried over matter — **graft** (original P3–P5 path kept bit-exact) vs. textbook **re-wiring** with key-matched transfer? |
 | H3 | Is the benefit of the P2 level smaller when the assigner already enlarges the candidate window of tiny boxes (Ultralytics' "window floor")? |
 | H4 | At matched GFLOPs, is a P2 level better than a higher input resolution? |
+| H5–H7 | added for round 2, see above |
 
 Design (priority order, so a partial run is still a coherent study): **tier 0** baseline vs. graft with the library-default assignment, 3 seeds each;
 **tier 1** one seed of the compute-matched baseline (base@896 px), naive re-wiring, classic-TAL baseline and graft, P2→P5 replacement and the two random-init controls;
-**tier 2** more seeds (first the classic-TAL cells, completing the 2×2 factorial, then naive/base@896/replace); **tier 3** a YOLO26 check.
+**tier 2** more seeds (first the classic-TAL cells, completing the 2×2 factorial, then naive/base@896/replace); **tier 3** a YOLO26 check; **tier 4** (round 2) the 70-epoch pair, key-matched graft and the 896 px pair.
 The planner fits tiers 0–1 into the budget; whatever time remains goes to tier 2.
 Evaluation: saved predictions, COCO AP on **original-resolution** boxes with 500 detections/img, TIDE with correct `xywh` boxes, paired image-level bootstrap,
 Ultralytics-validator cross-check, VisDrone ignore-region variant, protocol-sensitivity table (confidence truncation, detection cap).

@@ -55,6 +55,7 @@ with app.setup:
 
     STUDY_VERSION = "1.0.0"
     ULTRALYTICS_PIN = "8.4.150"
+    ROUND1_EPOCHS = 35  # schedule of the main study; round 2 (tier 4) extends it and must use the same one
     try:  # path of this notebook file (needed to start the detached worker); marimo provides __file__
         NOTEBOOK_FILE = Path(__file__).resolve()
     except NameError:  # pragma: no cover
@@ -1477,15 +1478,19 @@ def run_id_for(family, variant, tag, seed):
 
 
 @app.function
-def make_plan(epochs, seeds=(0, 1, 2), batch=32, families=("v10",), tiers=(0, 1, 2, 3), iso_size=896):
+def make_plan(epochs, seeds=(0, 1, 2), batch=32, families=("v10",), tiers=(0, 1, 2, 3, 4), iso_size=896):
     """Priority-ordered list of RunSpecs.  Tier 0 = headline contrast (3 seeds), tier 1 = one seed of everything else the hypotheses need
     (compute-matched resolution baseline, naive re-wiring, classic-TAL factorial cells, P5 removal, random init), tier 2 = more seeds of
-    those cells (completes the factorial first), tier 3 = second detector family."""
+    those cells (completes the factorial first), tier 3 = second detector family, tier 4 = round-2 extensions (key-matched graft, P2 at the high
+    resolution, twice the epochs)."""
     P: List[RunSpec] = []
 
-    def add(tier, family, variant, tag, group, seed, transfer="role", floor=16, imgsz=640, eval_sizes=(), notes=""):
-        P.append(RunSpec(run_id=run_id_for(family, variant, tag, seed), group=group, family=family, variant=variant, transfer=transfer,
-                         seed=seed, epochs=epochs, imgsz=imgsz, floor=floor, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
+    def add(tier, family, variant, tag, group, seed, transfer="role", floor=16, imgsz=640, eval_sizes=(), notes="", ep=None):
+        rid = run_id_for(family, variant, tag, seed)
+        if any(x.run_id == rid for x in P):  # the same run may be needed by two tiers
+            return
+        P.append(RunSpec(run_id=rid, group=group, family=family, variant=variant, transfer=transfer,
+                         seed=seed, epochs=ep or epochs, imgsz=imgsz, floor=floor, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
 
     fam = families[0]
     if 0 in tiers:
@@ -1515,6 +1520,16 @@ def make_plan(epochs, seeds=(0, 1, 2), batch=32, families=("v10",), tiers=(0, 1,
         for s in seeds[:2]:
             add(3, f2, "base", "f16", f"{f2} base", s)
             add(3, f2, "graft", "f16", f"{f2} graft", s)
+    if 4 in tiers:  # round-2 extensions (hypotheses H5-H7, added after the first result of round 1 was seen; the paper says so).  Order = priority:
+        # the long schedule first (it is the longest job and should overlap with the others), then the cheap transfer-rule control, then the high-resolution pair.
+        for sd in seeds[:2]:
+            add(4, fam, "base", "f16-long", f"base, {2 * epochs} epochs", sd, ep=2 * epochs, notes="H7")
+            add(4, fam, "graft", "f16-long", f"P2-Graft, {2 * epochs} epochs", sd, ep=2 * epochs, notes="H7")
+        for sd in seeds:
+            add(4, fam, "graft", "key", "P2-Graft, key-matched transfer", sd, transfer="key", notes="H5")
+        for sd in seeds:  # the third seed of the (expensive) high-resolution pair comes last and is the first to be dropped when the budget is short
+            add(4, fam, "base", f"res{iso_size}", f"base @ {iso_size}px", sd, imgsz=iso_size, notes="H6 reference")
+            add(4, fam, "graft", f"res{iso_size}", f"P2-Graft @ {iso_size}px", sd, imgsz=iso_size, notes="H6")
     return P
 
 
@@ -1533,6 +1548,16 @@ def choose_epochs(budget_s, specs_template, s_per_epoch, eval_s_per_run=240.0, f
     e = int(avail // max(units * s_per_epoch, 1e-6))
     e = max(lo, min(hi, e - e % 5))
     return e, {"runs_in_budget": len(must), "cost_units": units, "est_total_s": units * s_per_epoch * e + eval_s_per_run * len(must) + fixed_s}
+
+
+@app.function
+def estimate_gpu_gb(spec):
+    """GPU memory one training process occupies (the figure Ultralytics reports), from the first real run on the RTX PRO 6000 at batch 32 and 640 px:
+    17.5 GB for the baseline, 32-37 GB for the four-level models (the task-aligned assigner of dense VisDrone batches dominates); the baseline at 896 px
+    used 24-26 GB, so the size factor is 1 + 0.45 * (imgsz - 640) / 256.  Used only to stop the scheduler from starting a run that cannot fit next to the running ones."""
+    gb = 17.5 if spec.variant == "base" else 37.0
+    gb *= 1.0 + 0.45 * (spec.imgsz - 640) / 256.0
+    return gb * max(0.5, min(1.0, spec.batch / 32.0))
 
 
 @app.function
@@ -1717,6 +1742,7 @@ def worker_main(plan_path):
     write_status()
     log(f"worker started: {len(queue)} runs queued, {n_par} parallel, deadline in {fmt_hours(deadline - time.time())}", lp)
     oom_retried: set = set()
+    waiting_logged: set = set()
     stagger_s = float(plan.get("stagger_s", 60.0))
     last_start = 0.0
     while queue or running:
@@ -1750,6 +1776,13 @@ def worker_main(plan_path):
             if time.time() - last_start < stagger_s:
                 break
             spec = queue[0]
+            gpu_cap = float(plan.get("gpu_gb") or 0.0)
+            if gpu_cap and running and sum(estimate_gpu_gb(sp) for _, sp, _ in running.values()) + estimate_gpu_gb(spec) > gpu_cap:
+                if spec.run_id not in waiting_logged:
+                    waiting_logged.add(spec.run_id)
+                    log(f"{spec.run_id} waits: ~{estimate_gpu_gb(spec):.0f} GB would not fit next to the running jobs "
+                        f"({', '.join(f'{r} ~{estimate_gpu_gb(sp):.0f} GB' for r, (_, sp, _) in running.items())}) on a {gpu_cap:.0f} GB GPU", lp)
+                break
             est = estimate_run_seconds(spec, s_per_epoch, plan.get("eval_s", 240.0), ratio) * (1.0 + 0.15 * max(0, len(running)))
             if time.time() + est > deadline:
                 status[spec.run_id]["state"] = "skipped (would exceed time budget)"
@@ -2125,21 +2158,27 @@ def set_mpl_style():
 
 @app.function
 def condition_style(variant, transfer, floor, imgsz):
-    """Fixed colour / marker / hatch per experimental condition (identity never depends on how many conditions are shown)."""
+    """Fixed colour / marker / fill per experimental condition (identity never depends on how many conditions are shown; no two conditions share a marker)."""
     P = viz_palette()
-    if variant == "base" and transfer == "role" and imgsz == 640:
-        return {"color": P["blue"], "marker": "o", "hatch": "", "ls": "-"}
+    hollow = floor == 0  # classic TAL (no window floor) = same marker as its default-floor counterpart, drawn hollow
+    big = imgsz is not None and int(imgsz) != 640
+    if variant == "base" and transfer == "role":
+        if big:
+            return {"color": P["magenta"], "marker": "P", "hatch": "++", "ls": "-", "hollow": False}
+        return {"color": P["blue"], "marker": "o", "hatch": "", "ls": "-", "hollow": hollow}
     if variant == "graft" and transfer == "role":
-        return {"color": P["orange"], "marker": "s", "hatch": "//", "ls": "-"}
+        if big:
+            return {"color": P["magenta"], "marker": "X", "hatch": "xx", "ls": "--", "hollow": False}
+        return {"color": P["orange"], "marker": "s", "hatch": "//", "ls": "-", "hollow": hollow}
+    if variant == "graft" and transfer == "key":
+        return {"color": P["aqua"], "marker": "<", "hatch": "\\\\", "ls": "-.", "hollow": False}
     if variant == "naive":
-        return {"color": P["aqua"], "marker": "^", "hatch": "\\\\", "ls": "--"}
+        return {"color": P["aqua"], "marker": "^", "hatch": "\\\\", "ls": "--", "hollow": False}
     if variant == "replace":
-        return {"color": P["yellow"], "marker": "D", "hatch": "xx", "ls": "--"}
+        return {"color": P["yellow"], "marker": "D", "hatch": "xx", "ls": "--", "hollow": False}
     if transfer == "none":
-        return {"color": P["violet"], "marker": "v", "hatch": "..", "ls": ":"}
-    if variant == "base" and imgsz != 640:
-        return {"color": P["magenta"], "marker": "P", "hatch": "++", "ls": "-"}
-    return {"color": P["muted"], "marker": "x", "hatch": "", "ls": "-"}
+        return {"color": P["violet"], "marker": "v", "hatch": "..", "ls": ":", "hollow": variant == "graft"}
+    return {"color": P["muted"], "marker": "x", "hatch": "", "ls": "-", "hollow": False}
 
 
 @app.function
@@ -2355,16 +2394,21 @@ def fig_pareto(df, out_dir, metric="val_AP"):
                 continue
             v, t, fl, sz = cond.split("|")
             st = condition_style(v, t, int(fl) if fl != "None" else None, int(sz))
+            hol = st.get("hollow", False)
             ax.errorbar(g[xcol].mean(), g[metric].mean(), yerr=g[metric].std(ddof=1) if len(g) > 1 else 0, fmt=st["marker"], color=st["color"],
-                        markersize=7, markeredgecolor="white", markeredgewidth=1.2, elinewidth=1.0, capsize=2.5)
+                        markersize=7, markerfacecolor="white" if hol else st["color"], markeredgecolor=st["color"] if hol else "white",
+                        markeredgewidth=1.4 if hol else 1.2, elinewidth=1.0, capsize=2.5)
             lab = {"base": "baseline", "graft": "P2-Graft", "naive": "naive P2 re-wiring", "replace": "P2 replaces P5"}.get(v, v)
             if t == "none":
                 lab += ", random init"
+            if t == "key" and v == "graft":
+                lab += ", key-matched transfer"
             if int(sz) != 640:
                 lab += f" @{sz} px"
             if int(fl) == 0:
                 lab += ", classic TAL"
-            handles[lab] = Line2D([0], [0], marker=st["marker"], color="none", markerfacecolor=st["color"], markeredgecolor="white", markersize=7, label=lab)
+            handles[lab] = Line2D([0], [0], marker=st["marker"], color="none", markerfacecolor="white" if hol else st["color"],
+                                  markeredgecolor=st["color"] if hol else "white", markeredgewidth=1.4 if hol else 1.0, markersize=7, label=lab)
             if (v, t, int(fl), int(sz)) in (("base", "role", 16, 640), ("graft", "role", 16, 640)):  # direct labels only for the headline pair
                 ax.annotate("baseline" if v == "base" else "P2-Graft", (g[xcol].mean(), g[metric].mean()), textcoords="offset points", xytext=(5, -9), fontsize=6.8, color=P["ink2"])
         ax.set_xlabel(xl)
@@ -2530,8 +2574,11 @@ def fig_qualitative(work, out_dir, run_a, run_b, split="val", size=640, n=3, con
 
 # ------------------------------------------------------------------ analysis driver
 @app.function
-def canonical_keys(family="v10", iso_size=896):
+def canonical_keys(family="v10", iso_size=896, long_epochs=None):
+    long_family = f"{family}@e{long_epochs}" if long_epochs else f"{family}@long"
     return {
+        "graft_key": (family, "graft", "key", 16, 640), "graft_iso": (family, "graft", "role", 16, iso_size),
+        "base_long": (long_family, "base", "role", 16, 640), "graft_long": (long_family, "graft", "role", 16, 640),
         "base": (family, "base", "role", 16, 640), "graft": (family, "graft", "role", 16, 640),
         "base_f0": (family, "base", "role", 0, 640), "graft_f0": (family, "graft", "role", 0, 640),
         "naive": (family, "naive", "key", 16, 640), "replace": (family, "replace", "role", 16, 640),
@@ -2582,7 +2629,16 @@ def analyze(work, B=200, do_bootstrap=True, iso_size=896, family="v10", log_path
     import pandas as pd
     work = Path(work)
     df = collect_results(work)
-    A: Dict[str, Any] = {"n_runs": int(len(df)), "df": df, "keys": canonical_keys(family, iso_size)}
+    long_epochs, df_main = None, df
+    if not df.empty:  # runs with a longer schedule than the bulk (round-2 hypothesis H7) form their own conditions and stay out of the main figures
+        mode_e = int(df["epochs"].mode().iloc[0])
+        longm = df["epochs"] > mode_e
+        if longm.any():
+            long_epochs = int(df.loc[longm, "epochs"].max())
+            df = df.copy()
+            df.loc[longm, "family"] = df.loc[longm, "family"] + f"@e{long_epochs}"
+            df_main = df[~longm]
+    A: Dict[str, Any] = {"n_runs": int(len(df)), "df": df_main, "df_x": df, "keys": canonical_keys(family, iso_size, long_epochs), "long_epochs": long_epochs}
     if df.empty:
         return A
     metrics = ["val_AP", "val_AP50", "val_AP75", "val_APs", "val_APm", "val_APl", "val_AP_tiny", "val_AP_xsmall", "val_AP50_tiny",
@@ -2592,14 +2648,15 @@ def analyze(work, B=200, do_bootstrap=True, iso_size=896, family="v10", log_path
                "frac_aligned"] + [c for c in df.columns if c.startswith(("tide_", "ext_"))]
     A["agg"] = aggregate_groups(df, [m for m in metrics if m in df.columns])
     A["external"] = collect_external(work)
-    A["epochs"] = int(df["epochs"].mode().iloc[0])
+    A["epochs"] = int(df_main["epochs"].mode().iloc[0])
     K = A["keys"]
     present = {n: runs_for_key(df, k) for n, k in K.items()}
     A["present"] = {n: [s for s, _ in v] for n, v in present.items()}
     pairs = {"graft_vs_base": ("base", "graft"), "base_f0_vs_f16": ("base_f0", "base"), "graft_f0_vs_f16": ("graft_f0", "graft"),
              "naive_vs_graft": ("naive", "graft"), "replace_vs_graft": ("replace", "graft"), "scratch_vs_pretrained_graft": ("graft_scratch", "graft"),
              "scratch_vs_pretrained_base": ("base_scratch", "base"), "iso_vs_graft": ("iso", "graft"), "iso_vs_base": ("base", "iso"),
-             "graft_f0_vs_base_f0": ("base_f0", "graft_f0")}
+             "graft_f0_vs_base_f0": ("base_f0", "graft_f0"),
+             "graftkey_vs_graft": ("graft_key", "graft"), "isograft_vs_iso": ("iso", "graft_iso"), "long_graft_vs_base": ("base_long", "graft_long")}
     paired = {}
     for name, (a, b) in pairs.items():
         if present.get(a) and present.get(b):
@@ -2620,8 +2677,8 @@ def analyze(work, B=200, do_bootstrap=True, iso_size=896, family="v10", log_path
     # image-level bootstrap on VisDrone-val
     if do_bootstrap:
         need: Dict[str, int] = {}
-        for n in ("base", "graft", "base_f0", "graft_f0", "naive", "replace", "iso"):
-            sz = iso_size if n == "iso" else 640
+        for n in ("base", "graft", "base_f0", "graft_f0", "naive", "replace", "iso", "graft_key", "graft_iso", "base_long", "graft_long"):
+            sz = iso_size if n in ("iso", "graft_iso") else 640
             for _s, rid in present.get(n, []):
                 if run_pred_path(work, rid, "val", sz).exists():
                     need[rid] = sz
@@ -2647,6 +2704,14 @@ def analyze(work, B=200, do_bootstrap=True, iso_size=896, family="v10", log_path
                     A["bootstrap"]["interaction"] = {"AP": {"delta": float(d0[0]), "ci95": (float(np.percentile(d[:, 0], 2.5)), float(np.percentile(d[:, 0], 97.5)))},
                                                      "AP50": {"delta": float(d0[1]), "ci95": (float(np.percentile(d[:, 1], 2.5)), float(np.percentile(d[:, 1], 97.5)))},
                                                      "seeds": sorted(common4)}
+                common_l = seeds_of("base") & seeds_of("graft") & seeds_of("base_long") & seeds_of("graft_long")
+                if common_l:  # H7: (graft - base | long schedule) - (graft - base | short schedule)
+                    b0_, g0_, bl_, gl_ = (seed_avg(n, common_l) for n in ("base", "graft", "base_long", "graft_long"))
+                    d = (gl_[1:] - bl_[1:]) - (g0_[1:] - b0_[1:])
+                    d0 = (gl_[0] - bl_[0]) - (g0_[0] - b0_[0])
+                    A["bootstrap"]["long_interaction"] = {"AP": {"delta": float(d0[0]), "ci95": (float(np.percentile(d[:, 0], 2.5)), float(np.percentile(d[:, 0], 97.5)))},
+                                                          "AP50": {"delta": float(d0[1]), "ci95": (float(np.percentile(d[:, 1], 2.5)), float(np.percentile(d[:, 1], 97.5)))},
+                                                          "seeds": sorted(common_l)}
                 A["bootstrap_B"] = B
             except Exception as e:
                 A["bootstrap_error"] = repr(e)
@@ -2803,6 +2868,51 @@ def build_claims(A):
         C["sentences"]["iso"] = (f"A baseline trained and tested at higher resolution ({iso['imgsz']} px, {f1(iso['gflops'])} GFLOPs) reaches {f1(iso['val_AP'])} AP, "
                                  f"{abs(diff):.1f} points {'below' if diff < 0 else 'above'} P2-Graft at {f1(graft['gflops'])} GFLOPs.")
         C["short"]["iso"] = f"a baseline at higher resolution and matched GFLOPs is {abs(diff):.1f} points {'below' if diff < 0 else 'above'} P2-Graft ({p['n']} seed{'s' if p['n'] > 1 else ''})"
+    # ---- round-2 extensions
+    nseed = lambda p: f"{p['n']} seed{'s' if p['n'] > 1 else ''}"
+    if "graftkey_vs_graft" in P:  # H5: same architecture, role-based map vs key matching
+        p = P["graftkey_vs_graft"]["val_AP"]
+        ci = BS.get("graftkey_vs_graft", {}).get("AP", {}).get("ci95")
+        v, why = verdict_from(p["mean_delta"], ci, p["per_seed_delta"])
+        C["verdicts"]["H5"] = (v, why)
+        gk = cond_row(A, "graft_key")
+        frac = gk.get("frac_transferred")
+        inh = f" (it inherits {100 * frac:.0f}\\% of the inheritable pretrained parameters)" if isnum(frac) else ""
+        C["sentences"]["h5"] = (f"With the architecture held fixed, key-matched transfer{inh} gives {f1(gk['val_AP'])} AP, {abs(p['mean_delta']):.1f} points "
+                                f"{'below' if p['mean_delta'] > 0 else 'above'} the role-based map ({nseed(p)}).")
+        C["short"]["h5"] = f"for the same architecture, key-matched transfer is {abs(p['mean_delta']):.1f} points {'below' if p['mean_delta'] > 0 else 'above'} the role-based map"
+    if "isograft_vs_iso" in P:  # H6: does P2 still help at the compute-matched (high) resolution?
+        p = P["isograft_vs_iso"]["val_AP"]
+        ci = BS.get("isograft_vs_iso", {}).get("AP", {}).get("ci95")
+        v, why = verdict_from(p["mean_delta"], ci, p["per_seed_delta"])
+        C["verdicts"]["H6"] = (v, why)
+        gi, bi = cond_row(A, "graft_iso"), cond_row(A, "iso")
+        s6 = (f"At {bi['imgsz']}\\,px the stride-4 level changes AP by {sgn(p['mean_delta'])} ({f1(bi['val_AP'])}$\\rightarrow${f1(gi['val_AP'])}"
+              + (f"; 95\\% bootstrap interval [{sgn(ci[0])}, {sgn(ci[1])}]" if ci else "") + f", {nseed(p)})")
+        if base and graft:
+            s6 += f", against {sgn(graft['val_AP'] - base['val_AP'])} at 640\\,px"
+        C["sentences"]["h6"] = s6 + "."
+        C["short"]["h6"] = f"at {bi['imgsz']}\\,px P2-Graft changes AP by {sgn(p['mean_delta'])}" + (f" (interval [{sgn(ci[0])}, {sgn(ci[1])}])" if ci else "")
+    if "long_graft_vs_base" in P and base and graft:  # H7: does the benefit of the new level grow with a longer schedule?
+        p = P["long_graft_vs_base"]["val_AP"]
+        bl, gl = cond_row(A, "base_long"), cond_row(A, "graft_long")
+        long_e = A.get("long_epochs")
+        df = A["df_x"]
+        key = lambda k: {int(s_): float(x) for s_, x in zip(df[(df.family == A["keys"][k][0]) & (df.variant == A["keys"][k][1]) & (df.transfer == A["keys"][k][2]) &
+                                                           (df.floor == A["keys"][k][3]) & (df.imgsz == A["keys"][k][4])].seed,
+                                                           df[(df.family == A["keys"][k][0]) & (df.variant == A["keys"][k][1]) & (df.transfer == A["keys"][k][2]) &
+                                                              (df.floor == A["keys"][k][3]) & (df.imgsz == A["keys"][k][4])]["val_AP"])}
+        bs_, gs_, bl_, gl_ = key("base"), key("graft"), key("base_long"), key("graft_long")
+        seeds_c = sorted(set(bs_) & set(gs_) & set(bl_) & set(gl_))
+        dd = [(gl_[s_] - bl_[s_]) - (gs_[s_] - bs_[s_]) for s_ in seeds_c]
+        ci7 = BS.get("long_interaction", {}).get("AP", {}).get("ci95")
+        v, why = verdict_from(float(np.mean(dd)) if dd else float("nan"), ci7, dd)
+        C["verdicts"]["H7"] = (v, why)
+        gap_s, gap_l = graft["val_AP"] - base["val_AP"], gl["val_AP"] - bl["val_AP"]
+        C["sentences"]["h7"] = (f"With {long_e} instead of {A['epochs']} epochs the baseline reaches {f1(bl['val_AP'])} AP and P2-Graft {f1(gl['val_AP'])} AP ({nseed(p)}): the gain of the "
+                                f"stride-4 level is {sgn(gap_l)} against {sgn(gap_s)} with the shorter schedule"
+                                + (f" (difference of the gains {sgn(gap_l - gap_s)}, 95\\% bootstrap interval [{sgn(ci7[0])}, {sgn(ci7[1])}])" if ci7 else "") + ".")
+        C["short"]["h7"] = f"with {long_e} epochs the gain of the stride-4 level is {sgn(gap_l)} (against {sgn(gap_s)} with {A['epochs']})"
     return C
 
 
@@ -2948,10 +3058,34 @@ def larger_input_sentence(A):
 
 
 @app.function
+def table_ext(A):
+    """Round-2 conditions (H5-H7) next to their references."""
+    names = [("base", "baseline"), ("graft", "P2-Graft (role-based transfer)"), ("graft_key", "P2-Graft, key-matched transfer"),
+             ("iso", None), ("graft_iso", None), ("base_long", None), ("graft_long", None)]
+    rows, seen = [], set()
+    for key, nm in names:
+        r = cond_row(A, key)
+        if not r or key in seen:
+            continue
+        seen.add(key)
+        if nm is None:
+            nm = {"graft": "P2-Graft", "iso": f"baseline @ {r['imgsz']} px", "graft_iso": f"P2-Graft @ {r['imgsz']} px",
+                  "base_long": "baseline", "graft_long": "P2-Graft"}[key]
+        ep = A.get("long_epochs") if key.endswith("_long") else A.get("epochs")
+        rows.append([tex_escape(nm), str(ep), str(r["n"]), f1(r.get("gflops")), pmtex(r.get("val_AP50"), r.get("val_AP50_std")), pmtex(r.get("val_AP"), r.get("val_AP_std")),
+                     pmtex(r.get("val_APs"), r.get("val_APs_std")), pmtex(r.get("test_AP"), r.get("test_AP_std"))])
+    if len(rows) < 3:
+        return ""
+    return latex_table(["Model", "epochs", "$n$", "GFLOPs", "AP$_{50}$", "AP", "AP$_S$", "AP$^{\\mathrm{test}}$"], rows,
+                       "Extensions: transfer rule, resolution and schedule (VisDrone-val; test-dev in the last column), mean $\\pm$ std over $n$ seeds.", "tab:ext",
+                       colspec="lrrrrrrr", star=True)
+
+
+@app.function
 def table_perseed(A):
-    df = A["df"]
+    df = A.get("df_x", A["df"])
     rows = []
-    for _, r in df.sort_values(["variant", "transfer", "floor", "imgsz", "seed"]).iterrows():
+    for _, r in df.sort_values(["family", "variant", "transfer", "floor", "imgsz", "seed"]).iterrows():
         rows.append([tex_escape(r["run_id"]), f1(r.get("val_AP50")), f1(r.get("val_AP")), f1(r.get("val_APs")), f1(r.get("test_AP50")), f1(r.get("test_AP")),
                      f1(r.get("train_h"), 2)])
     if PAPER_STYLE["template"] == "lncs":  # narrow page: two half-tables side by side (same content, half the height)
@@ -3061,7 +3195,7 @@ def render_abstract(ctx):
         parts.append(f"An exact anchor analysis shows that {100 * a['P3-P5|floor=0']['frac_unassigned']:.1f}\\% of the training boxes own no anchor "
                      f"centre on P3--P5 under classic task-aligned assignment ({100 * a['P2-P5|floor=0']['frac_unassigned']:.1f}\\% with P2), "
                      "which the small-target window floor of the Ultralytics release removes by itself. ")
-    res = [sh[k] for k in ("main", "interaction", "naive", "iso") if k in sh]
+    res = [sh[k] for k in ("main", "iso", "h6", "h7", "h5", "naive", "interaction") if k in sh][:5]
     if res:
         parts.append("Results: " + "; ".join(res) + ".")
     return "".join(parts).strip()
@@ -3139,6 +3273,10 @@ def render_paper_tex(ctx):
     out.append("\\item[\\textbf{H2}] Does it matter \\emph{how} the pretrained weights are carried over (grafting vs.\\ re-wiring)?")
     out.append("\\item[\\textbf{H3}] Is the benefit of the stride-4 level smaller when the assigner already enlarges the candidate window of tiny boxes?")
     out.append("\\item[\\textbf{H4}] At matched compute, is a stride-4 level a better use of FLOPs than a higher input resolution?")
+    if any(k in C["verdicts"] for k in ("H5", "H6", "H7")):
+        out.append("\\item[\\textbf{H5}] (added after a first round of experiments) For the same architecture, does the role-based transfer beat Ultralytics' key matching?")
+        out.append("\\item[\\textbf{H6}] (added) Does the stride-4 level still help at the higher, compute-matched input resolution?")
+        out.append("\\item[\\textbf{H7}] (added) Does its benefit grow when the schedule is twice as long?")
     out.append("\\end{itemize}")
     out.append("\\textbf{Contributions.} (1) \\emph{P2-Graft}, a function-preserving way to extend a pretrained detector with a stride-4 level, together with an "
                "explicit role-based weight-transfer rule and transfer accounting (Section~\\ref{sec:method}). (2) An exact anchor-candidate analysis of VisDrone that "
@@ -3239,7 +3377,7 @@ def render_paper_tex(ctx):
         f"{int(min(10, max(1, E // 4))) if isinstance(E, int) else '--'} epochs, mixed precision, EMA, input 640\\,px (unless stated), the Ultralytics default augmentation otherwise. "
         "The schedule is deliberately short (the budget of one GPU session); absolute numbers are therefore lower than 300-epoch results reported in the literature and must not be compared with them.")
     gpu = env.get("gpu", "an NVIDIA GPU")
-    odd_batch = sorted(f"{r} (batch {int(b)})" for r, b in zip(A["df"]["run_id"], A["df"]["batch"]) if int(b) not in (32, -1)) if "batch" in A["df"] else []
+    odd_batch = sorted(f"{r} (batch {int(b)})" for r, b in zip(A["df_x"]["run_id"], A["df_x"]["batch"]) if int(b) not in (32, -1)) if "batch" in A["df_x"] else []
     lat_seq = bool("latency_seq" in A["df"] and len(A["df"]) and A["df"]["latency_seq"].fillna(False).astype(bool).all())
     lat_txt = ("Latency is the median of 300 batch-1 forward passes of the fused deploy graph in FP16, measured for one model at a time after all training had finished."
                if lat_seq else
@@ -3257,7 +3395,7 @@ def render_paper_tex(ctx):
         "(ii) VisDrone's ignore regions turned into per-class crowd regions, and (iii) larger test sizes. TIDE~\\cite{ref_tide} is computed from the same saved predictions.")
     out.append(
         f"\\textbf{{Statistics.}} Main conditions are repeated with {nseeds} seeds (initialisation of new layers, augmentation and data order). We report mean $\\pm$ sample standard deviation, paired per-seed differences, "
-        f"and a paired image-level bootstrap ({bs_B} resamples of the validation images, seed-averaged AP) for differences between conditions. The primary metric of H1--H4 is AP (IoU 0.50:0.95) on VisDrone-val. "
+        f"and a paired image-level bootstrap ({bs_B} resamples of the validation images, seed-averaged AP) for differences between conditions. The primary metric of all hypotheses is AP (IoU 0.50:0.95) on VisDrone-val. "
         "With so few seeds, p-values are not reported as evidence; single-seed controls are labelled as such.")
 
     # ------------------------------------------------------------------ 5 Results
@@ -3333,6 +3471,12 @@ def render_paper_tex(ctx):
     out.append(fig_block(figs, "fig_pareto", "Accuracy versus deploy GFLOPs (a) and versus measured latency (b); one marker per condition (mean over seeds).", "fig:pareto", wide=True))
     heading_if_content(out, _p, "\\subsection{Compute-matched comparison with input resolution}")
     _p = len(out)
+    ext = [S[k] for k in ("h5", "h6", "h7") if k in S]
+    if ext:
+        out.append(" ".join(ext) + " See Table~\\ref{tab:ext}; the hypotheses H5--H7 were added after the first round of experiments and are marked as such.")
+        out.append(table_ext(A))
+    heading_if_content(out, _p, "\\subsection{Extensions: transfer rule, resolution and schedule}")
+    _p = len(out)
     td = table_tide(A)
     if td:
         b, g = base, graft
@@ -3398,8 +3542,10 @@ def render_paper_tex(ctx):
     out.append("\\section{Discussion}\\label{sec:discussion}")
     rows = []
     desc = {"H1": "stride-4 level improves AP (library-default assignment)", "H2": "grafting transfers better than re-wiring",
-            "H3": "benefit of the level is smaller when the window floor is active", "H4": "at matched GFLOPs the level beats higher resolution"}
-    for h in ("H1", "H2", "H3", "H4"):
+            "H3": "benefit of the level is smaller when the window floor is active", "H4": "at matched GFLOPs the level beats higher resolution",
+            "H5": "role-based transfer beats key matching for the same architecture", "H6": "the level still helps at the higher resolution",
+            "H7": "the benefit of the level grows with a longer schedule"}
+    for h in ("H1", "H2", "H3", "H4") + (("H5", "H6", "H7") if any(k in C["verdicts"] for k in ("H5", "H6", "H7")) else ()):
         if h in C["verdicts"]:
             v, why = C["verdicts"][h]
             rows.append([h, tex_escape(desc[h]), verdict_word(v), tex_escape(why)])
@@ -3422,7 +3568,7 @@ def render_paper_tex(ctx):
     out.append(
         "\\textbf{Limitations.} (i) Short fine-tuning budget ("
         f"{E} epochs); the new level starts from random weights, so a longer schedule may favour it more than reported here. (ii) One training dataset (VisDrone) and one detector scale (nano); "
-        + ("a second detector family (YOLO26n) appears only in the run table of Appendix~\\ref{app:runs}, and " if (A["df"]["family"] != "v10").any() else "") + ext_note +
+        + ("a second detector family (YOLO26n) appears only in the run table of Appendix~\\ref{app:runs}, and " if A["df_x"]["family"].str.startswith("yolo26").any() else "") + ext_note +
         "(iii) Controls other than the main pair are single-seed unless Table~\\ref{tab:main} lists more. (iv) The window floor is a property of the Ultralytics release used; other frameworks differ. "
         "(v) Latency is measured on one GPU, not on embedded hardware. (vi) The main protocol follows the YOLO literature (no ignore-region rule); the ignore-region variant is reported. "
         "(vii) No state-of-the-art claim is made.")
@@ -3454,7 +3600,7 @@ def render_paper_tex(ctx):
     # ------------------------------------------------------------------ appendix
     out.append("\\appendix")
     out.append("\\section{All runs}\\label{app:runs}")
-    if not A["df"].empty:
+    if not A["df_x"].empty:
         out.append(table_perseed(A))
     if lncs and (Path(figs) / "fig_qualitative.pdf").exists():
         out.append("\\section{Qualitative examples}\\label{app:qual}")
@@ -3696,10 +3842,10 @@ def build_paper(work, out_dir=None, B=200, do_bootstrap=True, make_figs=True, lo
     tex = render_paper_tex(ctx)
     (out_dir / "main.tex").write_text(tex, encoding="utf-8")
     (out_dir / "references.bib").write_text(bib_text(), encoding="utf-8")
-    summary = {"claims": C, "analysis": {k: v for k, v in A.items() if k not in ("df", "agg")}, "exactness": exact, "assignability": assign,
+    summary = {"claims": C, "analysis": {k: v for k, v in A.items() if k not in ("df", "df_x", "agg")}, "exactness": exact, "assignability": assign,
                "transfer_audit": audit, "census": census, "env": env, "n_runs": A["n_runs"], "notebook_sha256": nb_hash, "study_version": STUDY_VERSION}
     jdump(summary, out_dir / "results_summary.json")
-    df.to_csv(out_dir / "all_runs.csv", index=False)
+    A["df_x"].to_csv(out_dir / "all_runs.csv", index=False)
     A["agg"].to_csv(out_dir / "conditions_summary.csv", index=False)
     # bundle (paper + figures + csv); predictions are zipped separately because they are large
     bundle = shutil.make_archive(str(work / "paper_bundle"), "zip", root_dir=str(out_dir))
@@ -4103,7 +4249,7 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
     now = time.time()
     plan = {"work": str(work), "specs": [asdict(s) for s in specs], "n_parallel": par["n_parallel"], "workers": par["workers"], "cache": cache, "device": None,
             "deadline": now + budget_h * 3600, "hard_deadline": now + min(budget_h * 3600 + 1800, 11.5 * 3600), "s_per_epoch": float(s_per_epoch),
-            "eval_s": 240.0, "tide": True, "test_dev": limit is None, "paper": paper or {}, "auto_paper": limit is None}
+            "eval_s": 240.0, "gpu_gb": float(par.get("gpu_gb") or 0.0), "tide": True, "test_dev": limit is None, "paper": paper or {}, "auto_paper": limit is None}
     if limit is not None:
         plan.update(limit=limit, data_suffix=f"_lim{limit}")
     if notebook_file:
@@ -4210,6 +4356,8 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         n_ep = int(epochs)
     elif limit is not None:
         n_ep = 1
+    elif 4 in tiers:  # round 2 extends round 1 and must use the same schedule (its 'long' runs use twice as many epochs)
+        n_ep = ROUND1_EPOCHS
     else:
         n_ep, _ = choose_epochs(budget_h * 3600, template_specs, spe, tiers=tuple(t for t in tiers if t <= 1) or (0,))
     specs = make_plan(n_ep, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
@@ -4316,11 +4464,12 @@ def _(mo):
 @app.cell
 def _(mo):
     work_input = mo.ui.text(value=str(default_work_dir()), label="Work directory (data, runs, results, paper)", full_width=True)
-    budget_h = mo.ui.slider(2.0, 10.0, value=8.5, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
+    budget_h = mo.ui.slider(2.0, 10.0, value=9.0, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
     seeds_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "1", "2"], label="Seeds of the main contrast")
-    tiers_ui = mo.ui.multiselect(options=["0", "1", "2", "3"], value=["0", "1", "2"],
-                                 label="Run tiers (0 = headline pair x seeds, 1 = one seed of: compute-matched, naive, classic-TAL, P5-removal, random-init, 2 = more seeds, 3 = YOLO26 family)")
-    epochs_ui = mo.ui.number(0, 300, step=5, value=0, label="Epochs per run (0 = choose automatically from the budget)")
+    tiers_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "4"],
+                                 label="Run tiers. ROUND 2 (default, extensions H5-H7) = 0 + 4: headline pair x seeds, then 70-epoch pair, key-matched graft, base and graft at 896 px. "
+                                       "ROUND 1 (main study H1-H4) = 0 + 1 + 2: one seed of compute-matched, naive, classic-TAL, P5-removal, random-init, then more seeds. 3 = YOLO26 family")
+    epochs_ui = mo.ui.number(0, 300, step=5, value=0, label="Epochs per run (0 = 35 in round 2, otherwise chosen from the budget)")
     iso_ui = mo.ui.dropdown(options=["800", "896", "960"], value="896", label="Compute-matched resolution baseline (px)")
     boot_ui = mo.ui.slider(50, 1000, value=300, step=50, label="Bootstrap resamples", show_value=True)
     template_ui = mo.ui.dropdown(options=["lncs", "article"], value="lncs",
@@ -4515,7 +4664,7 @@ def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, seeds_ui, tier
     _spe = _spe if _spe == _spe else (jload(WORK / "calibration.json", {}) or {}).get("s_per_epoch", 60.0)
     _template = make_plan(40, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
     _auto, _info = choose_epochs(budget_h.value * 3600, _template, _spe, tiers=tuple(t for t in _tiers if t <= 1) or (0,))
-    EPOCHS = int(epochs_ui.value) if epochs_ui.value else _auto
+    EPOCHS = int(epochs_ui.value) if epochs_ui.value else (ROUND1_EPOCHS if 4 in _tiers else _auto)
     PLAN = make_plan(EPOCHS, seeds=_seeds, tiers=_tiers, iso_size=int(iso_ui.value), families=("v10", "yolo26"))
     _tot = sum(estimate_run_seconds(s, _spe) for s in PLAN)
     _tab = pd.DataFrame([{"order": i + 1, "run": s.run_id, "tier": s.tier, "imgsz": s.imgsz, "epochs": s.epochs, "est. hours": round(estimate_run_seconds(s, _spe) / 3600, 2)}

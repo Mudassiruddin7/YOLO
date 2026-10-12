@@ -17,9 +17,9 @@ import graft_p2_study as G  # noqa: E402  (the notebook file is a plain importab
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--work", default=str(G.default_work_dir()))
-    ap.add_argument("--budget-hours", type=float, default=8.5)
+    ap.add_argument("--budget-hours", type=float, default=9.0)
     ap.add_argument("--seeds", default="0,1,2")
-    ap.add_argument("--tiers", default="0,1,2")
+    ap.add_argument("--tiers", default="0,4", help="0,4 = round 2 (extensions H5-H7); 0,1,2 = round 1 (main study H1-H4)")
     ap.add_argument("--epochs", type=int, default=0, help="0 = choose from the budget")
     ap.add_argument("--iso-size", type=int, default=896)
     ap.add_argument("--bootstrap", type=int, default=300)
