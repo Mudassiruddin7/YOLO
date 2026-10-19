@@ -556,8 +556,9 @@ def make_variant_cfg(base, variant, p2_backbone_idx=2):
     p2_block = [-1] + copy.deepcopy(p3_spec[1:])  # same block type / repeats / args as the P3 neck block
     up_spec = [p3_idx, 1, "nn.Upsample", [None, 2, "nearest"]]
     cat_spec = [[-1, p2_backbone_idx], 1, "Concat", [1]]
-    if variant == "graftd":  # graft with a twice as deep stride-4 neck block
-        p2_block[1] = max(2, 2 * int(p2_block[1]))
+    m_gd = re.fullmatch(r"graftd(\d*)", variant)
+    if m_gd:  # graft with a 2x (graftd) or k x (graftd<k>) deeper stride-4 neck block
+        p2_block[1] = int(p2_block[1]) * int(m_gd.group(1) or 2)
         variant = "graft"
     m_inj = re.fullmatch(r"inj(\d+)", variant)
     if m_inj:  # detail injection: the P3 head additionally sees a strided conv of the stride-4 backbone feature (new input channels, zero weights at start)
@@ -642,8 +643,8 @@ def role_key_rename(variant, n_base_layers=23):
 
     if variant == "base":
         return keep, (lambda k: False)
-    if variant in ("graft", "graftd", "inj", "assist") or re.fullmatch(r"(inj|assist)\d+", variant):
-        det_new = n_base_layers + {"graft": 3, "graftd": 3}.get(variant, 2 if variant.startswith("inj") else 5)
+    if variant == "graft" or re.fullmatch(r"graftd\d*", variant) or re.fullmatch(r"(inj|assist)\d+", variant):
+        det_new = n_base_layers + (3 if variant.startswith("graft") else (2 if variant.startswith("inj") else 5))
 
         def rn(k):
             return k.replace(pref(det_old), pref(det_new), 1) if k.startswith(pref(det_old)) else k
@@ -673,8 +674,9 @@ def warm_start_p2_entries(csd, msd, variant, n_base_layers=23, p3_block_idx=16):
         if k.startswith(f"model.{p3_block_idx}."):
             tail = k[len(f"model.{p3_block_idx}."):]
             cands = [f"model.{blk_new}.{tail}"]
-            if variant == "graftd" and tail.startswith("m.0."):
-                cands.append(f"model.{blk_new}.m.1.{tail[len('m.0.'):]}")
+            m_gd = re.fullmatch(r"graftd(\d*)", variant)
+            if m_gd and tail.startswith("m.0."):  # the deeper block's further bottlenecks start as copies of the pretrained one
+                cands += [f"model.{blk_new}.m.{j}.{tail[len('m.0.'):]}" for j in range(1, int(m_gd.group(1) or 2))]
             for nk in cands:
                 if nk in msd and tuple(msd[nk].shape) == tuple(v.shape):
                     extra[nk] = v
@@ -1658,6 +1660,39 @@ def make_search_plan(epochs=ROUND1_EPOCHS, seeds=(0, 1, 2), batch=32, family="v1
 
 
 @app.function
+def make_round4_plan(epochs=ROUND1_EPOCHS, final_epochs=90, seeds=(1, 2), family="v10", batch=32):
+    """Round 4 = the weak points of round 3, nothing selected any more.  Round 3 chose 'P2-Graft deep, warm-started' (graftd, role_ws) on validation.
+    Runs (longest first): the equal-compute baseline for the high-resolution result (baseline @1280 px has the GFLOPs of the selected model @896 px), more seeds of the long
+    baseline / selected pairs (round 3 had one seed), and 35-epoch ablations that separate depth from warm start and test a still deeper block.
+    Round 3 reproduced the numbers of rounds 1 and 2 to two decimals (same seeds -> same results on this hardware), so its runs are the references of this round."""
+    P: List[RunSpec] = []
+    v, t, lab = "graftd", "role_ws", SEARCH_POOL[3][3]
+
+    def add(tier, variant, transfer, tag, group, seed, imgsz=640, ep=None, eval_sizes=(), notes=""):
+        rid = run_id_for(family, variant, tag, seed)
+        if any(x.run_id == rid for x in P):
+            return
+        P.append(RunSpec(run_id=rid, group=group, family=family, variant=variant, transfer=transfer, seed=seed, epochs=ep or epochs, imgsz=imgsz,
+                         floor=16, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
+    E = int(final_epochs)
+    base_lab = SEARCH_POOL[0][3]
+    add(8, "base", "role", f"f1280e{E}", f"{base_lab}, 1280 px, {E} epochs", 0, imgsz=1280, ep=E, notes="round 4: equal-GFLOPs reference of the 896 px result")
+    s1 = seeds[0]
+    add(8, v, t, f"f896e{E}", f"{lab}, 896 px, {E} epochs", s1, imgsz=896, ep=E, eval_sizes=bigger_eval_sizes(896), notes="round 4: second seed")
+    add(8, "base", "role", f"f896e{E}", f"{base_lab}, 896 px, {E} epochs", s1, imgsz=896, ep=E, eval_sizes=bigger_eval_sizes(896), notes="round 4: second seed")
+    add(8, v, t, f"f640e{E}", f"{lab}, 640 px, {E} epochs", s1, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 4: second seed")
+    add(8, "base", "role", f"f640e{E}", f"{base_lab}, 640 px, {E} epochs", s1, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 4: second seed")
+    add(9, "graftd", "role", "f16", "P2-Graft deep, random-init level", 0, notes="ablation: depth without warm start")
+    add(9, "graftd3", "role_ws", "ws", "P2-Graft 3x deep, warm-started", 0, notes="ablation: still deeper")
+    for sd in seeds:
+        add(9, "graft", "role_ws", "ws", SEARCH_POOL[2][3], sd, notes="ablation: warm start without depth, more seeds")
+    for sd in seeds[1:]:
+        add(8, v, t, f"f640e{E}", f"{lab}, 640 px, {E} epochs", sd, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 4: third seed")
+        add(8, "base", "role", f"f640e{E}", f"{base_lab}, 640 px, {E} epochs", sd, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 4: third seed")
+    return P
+
+
+@app.function
 def fit_finals(budget_h, finals=((640, 100), (896, 100)), n_seeds=3, epochs=ROUND1_EPOCHS, units_per_hour=UNITS_PER_HOUR):
     """Shrink the final schedules (multiples of 10 epochs, at least 40) until stage A + B + C fit into the budget."""
     unit = lambda variant, imgsz, ep: cost_factor(RunSpec(run_id="x", group="x", variant=variant, imgsz=imgsz)) * ep / ROUND1_EPOCHS
@@ -1731,9 +1766,8 @@ def leaderboard(work):
             if c in d:
                 row[c] = float(d[c].mean())
                 row[c + "_std"] = float(d[c].std(ddof=1)) if len(d) > 1 else float("nan")
-        for sz in (800, 960, 1024):
-            c = f"val_AP_at{sz}"
-            if c in d and d[c].notna().any():
+        for c in [x for x in d.columns if re.fullmatch(r"(val|test)_AP(50)?_at\d+", x)]:
+            if d[c].notna().any():
                 row[c] = float(d[c].mean())
         rows.append(row)
     lb = pd.DataFrame(rows)
@@ -1753,13 +1787,14 @@ def leaderboard(work):
             else:
                 lb.loc[i, "d_" + m] = float(d[m].mean() - b[m].mean())
     lb = lb.sort_values(["imgsz", "epochs", "val_AP"], ascending=[True, True, False]).reset_index(drop=True)
-    head = ["label", "imgsz", "epochs", "n", "val AP", "d val", "val AP50", "test AP", "d test", "test AP50", "GFLOPs", "params M", "ms"]
+    big_cols = sorted(c for c in lb.columns if re.fullmatch(r"(val|test)_AP_at\d+", c))
+    head = ["label", "imgsz", "epochs", "n", "val AP", "d val", "val AP50", "test AP", "d test", "test AP50"] + [c.replace("_AP_at", " AP @") for c in big_cols] + ["GFLOPs", "params M", "ms"]
     md = ["| " + " | ".join(head) + " |", "|" + "---|" * len(head)]
     pm = lambda r, c: (f"{r[c]:.2f}" + (f"±{r[c + '_std']:.2f}" if isnum(r.get(c + "_std")) else "")) if isnum(r.get(c)) else "-"
     sg = lambda x: f"{x:+.2f}" if isnum(x) else "-"
     for _, r in lb.iterrows():
         md.append("| " + " | ".join([r["label"], str(int(r["imgsz"])), str(int(r["epochs"])), str(int(r["n"])), pm(r, "val_AP"), sg(r["d_val_AP"]), pm(r, "val_AP50"), pm(r, "test_AP"),
-                                      sg(r["d_test_AP"]), pm(r, "test_AP50"), f"{r['gflops']:.1f}" if isnum(r.get("gflops")) else "-",
+                                      sg(r["d_test_AP"]), pm(r, "test_AP50")] + [f"{r[c]:.2f}" if isnum(r.get(c)) else "-" for c in big_cols] + [f"{r['gflops']:.1f}" if isnum(r.get("gflops")) else "-",
                                       f"{r['params_deploy_M']:.2f}" if isnum(r.get("params_deploy_M")) else "-", f"{r['latency_ms']:.2f}" if isnum(r.get("latency_ms")) else "-"]) + " |")
     return lb, "\n".join(md)
 
@@ -1784,7 +1819,7 @@ def write_leaderboard(work):
 @app.function
 def cost_factor(spec):
     """Relative training cost of a run (pixels dominate: data loading + activations)."""
-    f = {"graft": 1.12, "graftd": 1.15, "naive": 1.12, "replace": 1.12}.get(spec.variant)
+    f = {"graft": 1.12, "graftd": 1.15, "graftd3": 1.18, "naive": 1.12, "replace": 1.12}.get(spec.variant)
     if f is None:
         f = 1.06 if spec.variant.startswith("inj") else (1.12 if spec.variant.startswith("assist") else 1.0)
     return (spec.imgsz / 640.0) ** 2 * f
@@ -1807,7 +1842,9 @@ def estimate_gpu_gb(spec):
     17.5 GB for the baseline, 32-37 GB for the four-level models (the task-aligned assigner of dense VisDrone batches dominates); the baseline at 896 px
     used 24-26 GB, so the size factor is 1 + 0.45 * (imgsz - 640) / 256.  Used only to stop the scheduler from starting a run that cannot fit next to the running ones."""
     gb = 17.5 if spec.variant == "base" else (19.0 if spec.variant.startswith("inj") else (25.0 if spec.variant.startswith("assist") else 37.0))
-    gb *= 1.0 + 0.45 * (spec.imgsz - 640) / 256.0
+    area = (spec.imgsz / 640.0) ** 2
+    # round 3 measured (batch 32): four-level model 36.8 GB at 640 px and 76.5 GB at 896 px (scales with the pixel count); baseline 17.5 GB at 640 px, ~25 GB at 896 px
+    gb *= area if spec.variant.startswith(("graft", "assist", "naive", "replace")) else 1.0 + 0.45 * (spec.imgsz - 640) / 256.0
     return gb * max(0.5, min(1.0, spec.batch / 32.0))
 
 
@@ -1995,7 +2032,7 @@ def worker_main(plan_path):
     oom_retried: set = set()
     waiting_logged: set = set()
     adaptive = plan.get("adaptive")
-    hook_pending = bool(adaptive)
+    hook_pending = bool(adaptive) and adaptive.get("mode") == "search"
     stagger_s = float(plan.get("stagger_s", 60.0))
     last_start = 0.0
     while queue or running or hook_pending:
@@ -2044,22 +2081,28 @@ def worker_main(plan_path):
         while queue and len(running) < n_par:
             if time.time() - last_start < stagger_s:
                 break
-            spec = queue[0]
             gpu_cap = float(plan.get("gpu_gb") or 0.0)
-            if gpu_cap and running and sum(estimate_gpu_gb(sp) for _, sp, _ in running.values()) + estimate_gpu_gb(spec) > gpu_cap:
-                if spec.run_id not in waiting_logged:
-                    waiting_logged.add(spec.run_id)
-                    log(f"{spec.run_id} waits: ~{estimate_gpu_gb(spec):.0f} GB would not fit next to the running jobs "
+            used_gb = sum(estimate_gpu_gb(sp) for _, sp, _ in running.values())
+            idx = None  # first queued run that fits next to the running ones (a big run that must wait does not block smaller ones behind it)
+            for j, cand in enumerate(queue):
+                if not (gpu_cap and running) or used_gb + estimate_gpu_gb(cand) <= gpu_cap:
+                    idx = j
+                    break
+                if cand.run_id not in waiting_logged:
+                    waiting_logged.add(cand.run_id)
+                    log(f"{cand.run_id} waits: ~{estimate_gpu_gb(cand):.0f} GB would not fit next to the running jobs "
                         f"({', '.join(f'{r} ~{estimate_gpu_gb(sp):.0f} GB' for r, (_, sp, _) in running.items())}) on a {gpu_cap:.0f} GB GPU", lp)
+            if idx is None:
                 break
+            spec = queue[idx]
             est = estimate_run_seconds(spec, s_per_epoch, plan.get("eval_s", 240.0), ratio) * (1.0 + 0.15 * max(0, len(running)))
             if time.time() + est > deadline:
                 status[spec.run_id]["state"] = "skipped (would exceed time budget)"
-                queue.pop(0)
+                queue.pop(idx)
                 log(f"skip {spec.run_id}: est {fmt_hours(est)} exceeds remaining {fmt_hours(deadline - time.time())}", lp)
                 continue
-            queue.pop(0)
-            args = {"work": str(work), "spec_dict": asdict(spec), "workers": plan["workers"], "cache": plan["cache"],
+            queue.pop(idx)
+            args = {"work": str(work), "spec_dict": asdict(spec), "workers": plan["workers"], "cache": (plan["cache"] if spec.imgsz <= 960 else False),
                     "device": plan.get("device"), "data_suffix": plan.get("data_suffix", ""), "limit": plan.get("limit"),
                     "tide": plan.get("tide", True), "test_dev": plan.get("test_dev", True)}
             env = dict(os.environ)
@@ -2125,10 +2168,11 @@ def flatten_result(r):
         m2 = r["metrics"].get(f"{split}|{sp['imgsz']}|o2m|std")
         if m2:
             row[f"{short}_AP50_o2m"], row[f"{short}_AP_o2m"] = m2["AP50"], m2["AP"]
-    for sz in (800, 896, 960):
-        m = r.get("metrics", {}).get(f"val|{sz}|o2o|std")
-        if m and sz != sp["imgsz"]:
-            row[f"val_AP50_at{sz}"], row[f"val_AP_at{sz}"], row[f"val_APs_at{sz}"] = m["AP50"], m["AP"], m["by_area"]["small"]["AP"]
+    for key_, m in r.get("metrics", {}).items():  # the same model tested at other input sizes (no retraining)
+        mm_ = re.fullmatch(r"(val|test-dev)\|(\d+)\|o2o\|std", key_)
+        if mm_ and isinstance(m, dict) and int(mm_.group(2)) != sp["imgsz"]:
+            pre_, sz = ("val" if mm_.group(1) == "val" else "test"), int(mm_.group(2))
+            row[f"{pre_}_AP50_at{sz}"], row[f"{pre_}_AP_at{sz}"], row[f"{pre_}_APs_at{sz}"] = m["AP50"], m["AP"], m["by_area"]["small"]["AP"]
     for ptag, short in (("conf0.05", "conf05"), ("conf0.25", "conf25"), ("maxdet100", "maxdet100")):
         mm = r.get("metrics", {}).get(f"val|{sp['imgsz']}|o2o|std@{ptag}")
         if mm:
@@ -4248,7 +4292,7 @@ def smoke_test(work, limit=48, size=320, device=None):
 
     step("environment", lambda: {k: env_info().get(k) for k in ("python", "torch", "ultralytics", "cuda_available", "gpu")})
     def exact():
-        reps = exactness_report(work, variants=("graft", "replace", "graftd", "inj16", "assist32"), modes={"graftd": "role_ws"})
+        reps = exactness_report(work, variants=("graft", "replace", "graftd", "graftd3", "inj16", "assist32"), modes={"graftd": "role_ws", "graftd3": "role_ws"})
         reps["graft+warm-start"] = exactness_report(work, variants=("graft",), modes={"graft": "role_ws"})["graft"]
         bad = [v for v, r in reps.items() if r["max_abs_feature_diff"] > 1e-4 or r["max_abs_head_output_diff"] > 1e-4]
         if bad:
@@ -4258,7 +4302,7 @@ def smoke_test(work, limit=48, size=320, device=None):
     for sp in ("train", "val"):
         step(f"prepare {sp} subset ({limit} images @ {size}px)", lambda sp=sp: bool(prepare_split(work, sp, sizes=(size,), limit=limit)))
     results = {}
-    for variant, transfer in (("base", "role"), ("graft", "role"), ("graft", "role_ws"), ("inj16", "role"), ("assist32", "role"), ("graftd", "role_ws")):
+    for variant, transfer in (("base", "role"), ("graft", "role"), ("graft", "role_ws"), ("inj16", "role"), ("assist32", "role"), ("graftd", "role_ws"), ("graftd3", "role_ws")):
         variant_key = variant if transfer == "role" else f"{variant}-{transfer}"
         spec = RunSpec(run_id=f"smoke-{variant_key}", group=variant_key, variant=variant, transfer=transfer, epochs=1, imgsz=size, batch=8, seed=0)
 
@@ -4547,7 +4591,7 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
 @app.function
 def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, iso_size=896, families=("v10", "yolo26"), notebook_file=None,
               skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None, template="lncs", bootstrap=300, log_path=None, launch=True, recalibrate=False,
-              search=False, finals=None):
+              search=False, finals=None, round4=False):
     """Everything between an EMPTY work directory and a RUNNING training worker (notebook steps ②-⑦), in one call.  Idempotent: finished parts are skipped.
     `limit` runs the whole thing on a tiny subset of the data (test mode: no analyses, no calibration, no automatic paper).
     Returns {"ok": bool, "steps": [{step, ok, seconds, detail}], "plan": dict | None, "pid": int | None}."""
@@ -4640,14 +4684,19 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         spe = float((jload(work / "calibration.json", {}) or {}).get("s_per_epoch", 60.0))
     seeds, tiers = tuple(seeds), tuple(tiers)
     adaptive = None
-    if search:
+    if round4:
+        n_ep = int(epochs) if epochs else ROUND1_EPOCHS
+        specs = make_round4_plan(n_ep, final_epochs=90)
+        adaptive = {"mode": "fixed"}
+        template_specs = specs
+    elif search:
         n_ep = int(epochs) if epochs else ROUND1_EPOCHS
         finals = [tuple(f) for f in finals] if finals else fit_finals(budget_h, n_seeds=len(seeds), epochs=n_ep)
         specs, adaptive = make_search_plan(n_ep, seeds=seeds, family="v10", finals=finals)
         template_specs = specs
     else:
         template_specs = make_plan(40, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
-    if search:
+    if search or round4:
         pass
     elif epochs:
         n_ep = int(epochs)
@@ -4657,15 +4706,17 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         n_ep = ROUND1_EPOCHS
     else:
         n_ep, _ = choose_epochs(budget_h * 3600, template_specs, spe, tiers=tuple(t for t in tiers if t <= 1) or (0,))
-    if not search:
+    if not (search or round4):
         specs = make_plan(n_ep, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
     if limit is not None:
         specs = [dataclasses.replace(s, batch=8, imgsz=min(s.imgsz, 320), eval_sizes=()) for s in specs]
-    cache = choose_cache(par["n_parallel"], need_gb=9.0 * (max(s.imgsz for s in specs) / 640.0) ** 2)
+    cache = choose_cache(par["n_parallel"], need_gb=9.0 * (max(s.imgsz for s in specs if s.imgsz <= 960) / 640.0) ** 2)  # (runs above 960 px are never cached)
     plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb, adaptive=adaptive,
                             paper={"B": int(bootstrap), "iso_size": int(iso_size), "template": template})
     jdump(plan, work / "plan_preview.json")
     summary = f"{len(specs)} runs x {n_ep} epochs, {spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}"
+    if round4:
+        summary = f"round 4: {len(specs)} runs (long seeds, equal-compute baseline at 1280 px, ablations); {spe:.0f} s/epoch, {par['n_parallel']} parallel, cache={cache}"
     if search:
         summary = (f"improvement search: {len(SEARCH_POOL)} candidates x {n_ep} epochs, then the best one with more seeds and long runs {finals}; "
                    f"{spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}")
@@ -4768,10 +4819,11 @@ def _(mo):
     work_input = mo.ui.text(value=str(default_work_dir()), label="Work directory (data, runs, results, paper)", full_width=True)
     budget_h = mo.ui.slider(2.0, 10.0, value=9.0, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
     seeds_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "1", "2"], label="Seeds of the main contrast")
-    mode_ui = mo.ui.dropdown(options={"Round 3 - improvement search: new architectures, pick the best, confirm, train long (recommended)": "search",
+    mode_ui = mo.ui.dropdown(options={"Round 4 - weak points of round 3: more seeds, equal-compute baseline at 1280 px, ablations (recommended after round 3)": "round4",
+                                      "Round 3 - improvement search: new architectures, pick the best, confirm, train long": "search",
                                       "Round 2 - extensions H5-H7 of the study (tiers below)": "tiers",
                                       "Round 1 / custom - tiers below": "tiers"},
-                             value="Round 3 - improvement search: new architectures, pick the best, confirm, train long (recommended)", label="What to run", full_width=True)
+                             value="Round 4 - weak points of round 3: more seeds, equal-compute baseline at 1280 px, ablations (recommended after round 3)", label="What to run", full_width=True)
     tiers_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "4"],
                                  label="Run tiers (only for Round 1/2). ROUND 2 = 0 + 4: headline pair x seeds, then 70-epoch pair, key-matched graft, base and graft at 896 px. "
                                        "ROUND 1 (main study H1-H4) = 0 + 1 + 2: one seed of compute-matched, naive, classic-TAL, P5-removal, random-init, then more seeds. 3 = YOLO26 family")
@@ -4850,7 +4902,7 @@ def _(WORK, auto_btn, auto_ok, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_study.py")
     AUTO = autopilot(WORK, budget_h=float(budget_h.value), seeds=tuple(int(s) for s in seeds_ui.value) or (0, 1, 2), tiers=tuple(int(t) for t in tiers_ui.value) or (0, 1),
                      epochs=int(epochs_ui.value or 0), iso_size=int(iso_ui.value), notebook_file=str(_nb), template=template_ui.value, bootstrap=int(boot_ui.value),
-                     search=(mode_ui.value == "search"), log_path=WORK / "logs" / "autopilot.log")
+                     search=(mode_ui.value == "search"), round4=(mode_ui.value == "round4"), log_path=WORK / "logs" / "autopilot.log")
     _lines = [f"- {'✅' if s['ok'] else '❌'} **{s['step']}** ({s['seconds']} s): `{str(s['detail'])[:600]}`" for s in AUTO["steps"]]
     mo.vstack([mo.callout(mo.md("**Autopilot finished: the worker is running — follow it in ⑧.**" if AUTO["ok"] else "**Autopilot stopped at a failed step** — read the last line, fix it, press the button again."),
                           kind="success" if AUTO["ok"] else "danger"), mo.md("\n".join(_lines))])
@@ -4968,7 +5020,10 @@ def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui, seeds
     _tiers = tuple(int(t) for t in tiers_ui.value) or (0, 1)
     _spe = float(CALIB.get("s_per_epoch", float("nan"))) if CALIB else float("nan")
     _spe = _spe if _spe == _spe else (jload(WORK / "calibration.json", {}) or {}).get("s_per_epoch", 60.0)
-    if mode_ui.value == "search":
+    if mode_ui.value == "round4":
+        EPOCHS = int(epochs_ui.value) if epochs_ui.value else ROUND1_EPOCHS
+        PLAN, ADAPT = make_round4_plan(EPOCHS, final_epochs=90), {"mode": "fixed"}
+    elif mode_ui.value == "search":
         EPOCHS = int(epochs_ui.value) if epochs_ui.value else ROUND1_EPOCHS
         PLAN, ADAPT = make_search_plan(EPOCHS, seeds=_seeds, finals=fit_finals(float(budget_h.value), n_seeds=len(_seeds), epochs=EPOCHS))
     else:

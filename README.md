@@ -1,19 +1,14 @@
 # P2-Graft — one marimo notebook for a controlled small-object study (YOLOv10n × VisDrone)
 
-> **START HERE (molab, RTX PRO 6000, 12 h) — ROUND 3: improvement search (the default)**
+> **START HERE (molab, RTX PRO 6000, 12 h) — ROUND 4 (the default now)**
 > 1. molab → new notebook → paste `https://github.com/Mudassiruddin7/YOLO/blob/main/graft_p2_study.py` → notebook-specs button → **toggle the GPU**.
-> 2. Press **Run all** and keep the tab open and the computer awake. Nothing else has to be clicked. ≈ 8 h of training in a 12 h session.
-> 3. When ⑧ says the worker has finished, **download `diagnostics.zip` from ⑩** (it contains `results/leaderboard.csv`, `all_runs.csv`, `search_selection.json`, every run's `result.json`, logs) before the session ends.
+> 2. Press **Run all**, keep the tab open and the computer awake (≈ 7–8 h). Download `diagnostics.zip` from ⑩ when ⑧ says the worker has finished.
 >
-> **What round 3 does** (all candidates start *exactly* at the pretrained YOLOv10n, all use the identical recipe):
-> * **Stage A** (one seed, 35 epochs, 640 px): baseline, P2-Graft, P2-Graft with a *warm-started* new level (initialised from the pretrained P3 level instead of at random),
->   a twice as deep warm-started graft, *detail injection* (the P3 head additionally sees a strided conv of the stride-4 backbone feature, +4 % GFLOPs) and *P2-assisted P3* (the stride-4 neck block is folded into the P3 head, no stride-4 level).
-> * The candidate with the best **validation** AP is selected automatically (test-dev is never used for any decision).
-> * **Stage B**: seeds 1 and 2 of the baseline, of the selected candidate and of plain P2-Graft.
-> * **Stage C**: baseline and selected candidate trained long (≈ 90 epochs, fitted to the budget) at 640 px and at 896 px, each also tested at a larger size. Same-epoch pairs give (i) the standard-resolution comparison, (ii) the best absolute result, and (iii) the compute-matched comparison (candidate at 640 px vs baseline at 896 px, ≈ equal GFLOPs).
+> **Round 3 (done, 16 runs, 7 h)** chose *P2-Graft deep, warm-started* (stride-4 level with a 2× deeper block, initialised from the pretrained P3 level): +2.26 val AP at 35 epochs (3 seeds), and
+> +2.81 val / +1.53 test-dev AP at 90 epochs / 640 px; +2.15 / +0.97 at 896 px (1 seed). Round 3 reproduced the numbers of rounds 1 and 2 to two decimals, so those sessions are directly comparable.
+> **Round 4 fixes round 3's weak points:** the equal-compute baseline for the 896 px result (baseline @1280 px, 90 epochs), seeds 1–2 of the long 640 px pair and seed 1 of the 896 px pair (round 3 had one seed),
+> and 35-epoch ablations that separate depth from warm start (deep without warm start, warm start without depth, 3× deep). Earlier modes remain in cell ① (*What to run*).
 >
-> Older modes (round 1 = main study H1–H4, round 2 = extensions H5–H7) are still available in cell ① (*What to run*). Details, molab facts and troubleshooting are below.
-
 ### Round 1 — results (molab, RTX PRO 6000, 23 runs, 35 epochs, VisDrone-val, mean over 3 seeds unless stated)
 
 | model | AP | AP50 | AP_S | test-dev AP | GFLOPs | deploy params |
