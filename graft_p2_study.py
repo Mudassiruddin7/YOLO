@@ -1693,6 +1693,34 @@ def make_round4_plan(epochs=ROUND1_EPOCHS, final_epochs=90, seeds=(1, 2), family
 
 
 @app.function
+def make_round5_plan(epochs=ROUND1_EPOCHS, final_epochs=90, family="v10", batch=32):
+    """Round 5 = does a (nearly) free addition beat the resolution frontier?  Rounds 3 and 4 showed that the four-level models are dominated by simply training the baseline at a higher
+    input size (baseline @1280 px 28.3 AP vs deep warm-started graft @896 px 25.4 AP at equal GFLOPs).  Detail injection costs +4% GFLOPs and gave +1.1 AP (one seed, 35 epochs):
+    above the frontier.  Here: its seeds and neighbours (8 / 32 channels) at 35 epochs, and long runs at 640 / 896 / 1280 px against the baselines of rounds 3 and 4, plus the
+    baseline at 1536 px to see where the frontier ends.  Round 3 reproduced rounds 1 and 2 to two decimals, so earlier sessions are valid references."""
+    P: List[RunSpec] = []
+
+    def add(tier, variant, transfer, tag, group, seed, imgsz=640, ep=None, eval_sizes=(), notes=""):
+        rid = run_id_for(family, variant, tag, seed)
+        if any(x.run_id == rid for x in P):
+            return
+        P.append(RunSpec(run_id=rid, group=group, family=family, variant=variant, transfer=transfer, seed=seed, epochs=ep or epochs, imgsz=imgsz,
+                         floor=16, batch=batch, tier=tier, eval_sizes=tuple(eval_sizes), notes=notes))
+    E = int(final_epochs)
+    lab = SEARCH_POOL[4][3]
+    add(10, "inj16", "role", f"f1280e{E}", f"{lab}, 1280 px, {E} epochs", 0, imgsz=1280, ep=E, notes="round 5: vs baseline @1280 (round 4)")
+    add(10, "inj16", "role", f"f896e{E}", f"{lab}, 896 px, {E} epochs", 0, imgsz=896, ep=E, eval_sizes=bigger_eval_sizes(896), notes="round 5: vs baseline @896")
+    add(10, "inj16", "role", f"f640e{E}", f"{lab}, 640 px, {E} epochs", 0, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 5: vs baseline @640")
+    for sd in (1, 2):
+        add(11, "inj16", "role", "f16", lab, sd, notes="round 5: seeds of the 35-epoch result")
+    add(11, "inj8", "role", "f16", "detail injection (8 ch)", 0, notes="round 5: how little is enough")
+    add(11, "inj32", "role", "f16", "detail injection (32 ch)", 0, notes="round 5: how much helps")
+    add(10, "inj16", "role", f"f640e{E}", f"{lab}, 640 px, {E} epochs", 1, ep=E, eval_sizes=bigger_eval_sizes(640), notes="round 5: second seed")
+    add(10, "base", "role", f"f1536e{E}", f"{SEARCH_POOL[0][3]}, 1536 px, {E} epochs", 0, imgsz=1536, ep=E, notes="round 5: where does the resolution frontier end?")
+    return P
+
+
+@app.function
 def fit_finals(budget_h, finals=((640, 100), (896, 100)), n_seeds=3, epochs=ROUND1_EPOCHS, units_per_hour=UNITS_PER_HOUR):
     """Shrink the final schedules (multiples of 10 epochs, at least 40) until stage A + B + C fit into the budget."""
     unit = lambda variant, imgsz, ep: cost_factor(RunSpec(run_id="x", group="x", variant=variant, imgsz=imgsz)) * ep / ROUND1_EPOCHS
@@ -1786,6 +1814,25 @@ def leaderboard(work):
                 lb.loc[i, "d_" + m] = float(np.mean([float(d[d.seed == s_][m].iloc[0]) - float(b[b.seed == s_][m].iloc[0]) for s_ in common]))
             else:
                 lb.loc[i, "d_" + m] = float(d[m].mean() - b[m].mean())
+    # distance to the resolution frontier: AP of the baseline (same schedule) interpolated at this model's GFLOPs (needs the baseline at >= 2 input sizes)
+    lb["d_frontier_val"] = float("nan")
+    lb["d_frontier_test"] = float("nan")
+    for ep_ in sorted(set(lb["epochs"])):
+        pts = lb[(lb.variant == "base") & (lb.transfer == "role") & (lb.floor == 16) & (lb.epochs == ep_)].sort_values("gflops")
+        if len(pts) < 2:
+            continue
+        xs = np.log(pts["gflops"].to_numpy(dtype=float))
+
+        def front(g, col):
+            ys = pts[col].to_numpy(dtype=float)
+            x = float(np.log(g))
+            k = int(np.clip(np.searchsorted(xs, x) - 1, 0, len(xs) - 2))  # segment (linear in log GFLOPs, extended beyond the ends)
+            return float(ys[k] + (ys[k + 1] - ys[k]) * (x - xs[k]) / (xs[k + 1] - xs[k]))
+        for i, r in lb[lb.epochs == ep_].iterrows():
+            if isnum(r.get("gflops")):
+                lb.loc[i, "d_frontier_val"] = r["val_AP"] - front(r["gflops"], "val_AP")
+                if isnum(r.get("test_AP")):
+                    lb.loc[i, "d_frontier_test"] = r["test_AP"] - front(r["gflops"], "test_AP")
     lb = lb.sort_values(["imgsz", "epochs", "val_AP"], ascending=[True, True, False]).reset_index(drop=True)
     big_cols = sorted(c for c in lb.columns if re.fullmatch(r"(val|test)_AP_at\d+", c))
     head = ["label", "imgsz", "epochs", "n", "val AP", "d val", "val AP50", "test AP", "d test", "test AP50"] + [c.replace("_AP_at", " AP @") for c in big_cols] + ["GFLOPs", "params M", "ms"]
@@ -1838,13 +1885,18 @@ def choose_epochs(budget_s, specs_template, s_per_epoch, eval_s_per_run=240.0, f
 
 @app.function
 def estimate_gpu_gb(spec):
-    """GPU memory one training process occupies (the figure Ultralytics reports), from the first real run on the RTX PRO 6000 at batch 32 and 640 px:
-    17.5 GB for the baseline, 32-37 GB for the four-level models (the task-aligned assigner of dense VisDrone batches dominates); the baseline at 896 px
-    used 24-26 GB, so the size factor is 1 + 0.45 * (imgsz - 640) / 256.  Used only to stop the scheduler from starting a run that cannot fit next to the running ones."""
-    gb = 17.5 if spec.variant == "base" else (19.0 if spec.variant.startswith("inj") else (25.0 if spec.variant.startswith("assist") else 37.0))
-    area = (spec.imgsz / 640.0) ** 2
-    # round 3 measured (batch 32): four-level model 36.8 GB at 640 px and 76.5 GB at 896 px (scales with the pixel count); baseline 17.5 GB at 640 px, ~25 GB at 896 px
-    gb *= area if spec.variant.startswith(("graft", "assist", "naive", "replace")) else 1.0 + 0.45 * (spec.imgsz - 640) / 256.0
+    """GPU memory one training process occupies (the figure Ultralytics reports, batch 32).  Measured on the RTX PRO 6000: baseline 17.5 GB at 640 px, 19-25 GB at 896 px,
+    47 GB at 1280 px; four-level models 33-37 GB at 640 px and 76.5 GB at 896 px (they scale with the pixel count).  Used only to keep the scheduler from starting a run
+    that cannot fit next to the running ones."""
+    base = float(np.interp(spec.imgsz, [640, 896, 1280, 1536], [17.5, 25.0, 47.0, 68.0]))
+    if spec.variant.startswith(("graft", "naive", "replace")):
+        gb = 37.0 * (spec.imgsz / 640.0) ** 2
+    elif spec.variant.startswith("assist"):
+        gb = base + 8.0 * (spec.imgsz / 640.0) ** 2
+    elif spec.variant.startswith("inj"):
+        gb = base + 1.5
+    else:
+        gb = base
     return gb * max(0.5, min(1.0, spec.batch / 32.0))
 
 
@@ -2083,15 +2135,32 @@ def worker_main(plan_path):
                 break
             gpu_cap = float(plan.get("gpu_gb") or 0.0)
             used_gb = sum(estimate_gpu_gb(sp) for _, sp, _ in running.values())
-            idx = None  # first queued run that fits next to the running ones (a big run that must wait does not block smaller ones behind it)
+            idx = None  # first queued run that fits next to the running ones.  A big run that has to wait is protected (backfilling): a smaller run behind it
+            blocked, head_start = None, 0.0  # may only start if it leaves room for the big one or will be finished by the time that room exists
             for j, cand in enumerate(queue):
-                if not (gpu_cap and running) or used_gb + estimate_gpu_gb(cand) <= gpu_cap:
+                gb_c = estimate_gpu_gb(cand)
+                fits = not (gpu_cap and running) or used_gb + gb_c <= gpu_cap
+                if blocked is None:
+                    if fits:
+                        idx = j
+                        break
+                    blocked = cand
+                    if cand.run_id not in waiting_logged:
+                        waiting_logged.add(cand.run_id)
+                        log(f"{cand.run_id} waits: ~{gb_c:.0f} GB would not fit next to the running jobs "
+                            f"({', '.join(f'{r} ~{estimate_gpu_gb(sp):.0f} GB' for r, (_, sp, _) in running.items())}) on a {gpu_cap:.0f} GB GPU", lp)
+                    t_free, left = time.time(), used_gb  # when will enough memory be free?  (estimated end of the running jobs, earliest first)
+                    for end_t, gb_r in sorted((t0_ + float(status[r_].get("est_s") or 0.0), estimate_gpu_gb(sp_)) for r_, (_, sp_, t0_) in running.items()):
+                        if left + gb_c <= gpu_cap:
+                            break
+                        left -= gb_r
+                        t_free = max(t_free, end_t)
+                    head_start = t_free
+                    continue
+                est_c = estimate_run_seconds(cand, s_per_epoch, plan.get("eval_s", 240.0), ratio) * (1.0 + 0.15 * max(0, len(running)))
+                if fits and (used_gb + gb_c + estimate_gpu_gb(blocked) <= gpu_cap or time.time() + est_c <= head_start):
                     idx = j
                     break
-                if cand.run_id not in waiting_logged:
-                    waiting_logged.add(cand.run_id)
-                    log(f"{cand.run_id} waits: ~{estimate_gpu_gb(cand):.0f} GB would not fit next to the running jobs "
-                        f"({', '.join(f'{r} ~{estimate_gpu_gb(sp):.0f} GB' for r, (_, sp, _) in running.items())}) on a {gpu_cap:.0f} GB GPU", lp)
             if idx is None:
                 break
             spec = queue[idx]
@@ -4591,7 +4660,7 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
 @app.function
 def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, iso_size=896, families=("v10", "yolo26"), notebook_file=None,
               skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None, template="lncs", bootstrap=300, log_path=None, launch=True, recalibrate=False,
-              search=False, finals=None, round4=False):
+              search=False, finals=None, round4=False, round5=False):
     """Everything between an EMPTY work directory and a RUNNING training worker (notebook steps ②-⑦), in one call.  Idempotent: finished parts are skipped.
     `limit` runs the whole thing on a tiny subset of the data (test mode: no analyses, no calibration, no automatic paper).
     Returns {"ok": bool, "steps": [{step, ok, seconds, detail}], "plan": dict | None, "pid": int | None}."""
@@ -4684,9 +4753,9 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         spe = float((jload(work / "calibration.json", {}) or {}).get("s_per_epoch", 60.0))
     seeds, tiers = tuple(seeds), tuple(tiers)
     adaptive = None
-    if round4:
+    if round4 or round5:
         n_ep = int(epochs) if epochs else ROUND1_EPOCHS
-        specs = make_round4_plan(n_ep, final_epochs=90)
+        specs = make_round5_plan(n_ep, final_epochs=90) if round5 else make_round4_plan(n_ep, final_epochs=90)
         adaptive = {"mode": "fixed"}
         template_specs = specs
     elif search:
@@ -4696,7 +4765,7 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         template_specs = specs
     else:
         template_specs = make_plan(40, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
-    if search or round4:
+    if search or round4 or round5:
         pass
     elif epochs:
         n_ep = int(epochs)
@@ -4706,7 +4775,7 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
         n_ep = ROUND1_EPOCHS
     else:
         n_ep, _ = choose_epochs(budget_h * 3600, template_specs, spe, tiers=tuple(t for t in tiers if t <= 1) or (0,))
-    if not (search or round4):
+    if not (search or round4 or round5):
         specs = make_plan(n_ep, seeds=seeds, tiers=tiers, iso_size=int(iso_size), families=tuple(families))
     if limit is not None:
         specs = [dataclasses.replace(s, batch=8, imgsz=min(s.imgsz, 320), eval_sizes=()) for s in specs]
@@ -4715,6 +4784,8 @@ def autopilot(work, budget_h=8.5, seeds=(0, 1, 2), tiers=(0, 1, 2), epochs=0, is
                             paper={"B": int(bootstrap), "iso_size": int(iso_size), "template": template})
     jdump(plan, work / "plan_preview.json")
     summary = f"{len(specs)} runs x {n_ep} epochs, {spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}"
+    if round5:
+        summary = f"round 5: {len(specs)} runs (detail injection against the resolution frontier); {spe:.0f} s/epoch, {par['n_parallel']} parallel, cache={cache}"
     if round4:
         summary = f"round 4: {len(specs)} runs (long seeds, equal-compute baseline at 1280 px, ablations); {spe:.0f} s/epoch, {par['n_parallel']} parallel, cache={cache}"
     if search:
@@ -4817,13 +4888,14 @@ def _(mo):
 @app.cell
 def _(mo):
     work_input = mo.ui.text(value=str(default_work_dir()), label="Work directory (data, runs, results, paper)", full_width=True)
-    budget_h = mo.ui.slider(2.0, 10.0, value=9.0, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
+    budget_h = mo.ui.slider(2.0, 10.0, value=10.0, step=0.5, label="Budget for training + evaluation (hours, counted from the launch; the 12 h session also has to fit ~1 h of set-up before it and ~0.7 h of paper building after it)", show_value=True)
     seeds_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "1", "2"], label="Seeds of the main contrast")
-    mode_ui = mo.ui.dropdown(options={"Round 4 - weak points of round 3: more seeds, equal-compute baseline at 1280 px, ablations (recommended after round 3)": "round4",
+    mode_ui = mo.ui.dropdown(options={"Round 5 - does a nearly free addition beat the resolution frontier? detail injection at 640 / 896 / 1280 px (recommended now)": "round5",
+                                      "Round 4 - weak points of round 3: more seeds, equal-compute baseline at 1280 px, ablations (recommended after round 3)": "round4",
                                       "Round 3 - improvement search: new architectures, pick the best, confirm, train long": "search",
                                       "Round 2 - extensions H5-H7 of the study (tiers below)": "tiers",
                                       "Round 1 / custom - tiers below": "tiers"},
-                             value="Round 4 - weak points of round 3: more seeds, equal-compute baseline at 1280 px, ablations (recommended after round 3)", label="What to run", full_width=True)
+                             value="Round 5 - does a nearly free addition beat the resolution frontier? detail injection at 640 / 896 / 1280 px (recommended now)", label="What to run", full_width=True)
     tiers_ui = mo.ui.multiselect(options=["0", "1", "2", "3", "4"], value=["0", "4"],
                                  label="Run tiers (only for Round 1/2). ROUND 2 = 0 + 4: headline pair x seeds, then 70-epoch pair, key-matched graft, base and graft at 896 px. "
                                        "ROUND 1 (main study H1-H4) = 0 + 1 + 2: one seed of compute-matched, naive, classic-TAL, P5-removal, random-init, then more seeds. 3 = YOLO26 family")
@@ -4902,7 +4974,7 @@ def _(WORK, auto_btn, auto_ok, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_study.py")
     AUTO = autopilot(WORK, budget_h=float(budget_h.value), seeds=tuple(int(s) for s in seeds_ui.value) or (0, 1, 2), tiers=tuple(int(t) for t in tiers_ui.value) or (0, 1),
                      epochs=int(epochs_ui.value or 0), iso_size=int(iso_ui.value), notebook_file=str(_nb), template=template_ui.value, bootstrap=int(boot_ui.value),
-                     search=(mode_ui.value == "search"), round4=(mode_ui.value == "round4"), log_path=WORK / "logs" / "autopilot.log")
+                     search=(mode_ui.value == "search"), round4=(mode_ui.value == "round4"), round5=(mode_ui.value == "round5"), log_path=WORK / "logs" / "autopilot.log")
     _lines = [f"- {'✅' if s['ok'] else '❌'} **{s['step']}** ({s['seconds']} s): `{str(s['detail'])[:600]}`" for s in AUTO["steps"]]
     mo.vstack([mo.callout(mo.md("**Autopilot finished: the worker is running — follow it in ⑧.**" if AUTO["ok"] else "**Autopilot stopped at a failed step** — read the last line, fix it, press the button again."),
                           kind="success" if AUTO["ok"] else "danger"), mo.md("\n".join(_lines))])
@@ -5020,9 +5092,9 @@ def _(CALIB, PAR, WORK, boot_ui, budget_h, epochs_ui, iso_ui, mo, mode_ui, seeds
     _tiers = tuple(int(t) for t in tiers_ui.value) or (0, 1)
     _spe = float(CALIB.get("s_per_epoch", float("nan"))) if CALIB else float("nan")
     _spe = _spe if _spe == _spe else (jload(WORK / "calibration.json", {}) or {}).get("s_per_epoch", 60.0)
-    if mode_ui.value == "round4":
+    if mode_ui.value in ("round4", "round5"):
         EPOCHS = int(epochs_ui.value) if epochs_ui.value else ROUND1_EPOCHS
-        PLAN, ADAPT = make_round4_plan(EPOCHS, final_epochs=90), {"mode": "fixed"}
+        PLAN, ADAPT = (make_round5_plan if mode_ui.value == "round5" else make_round4_plan)(EPOCHS, final_epochs=90), {"mode": "fixed"}
     elif mode_ui.value == "search":
         EPOCHS = int(epochs_ui.value) if epochs_ui.value else ROUND1_EPOCHS
         PLAN, ADAPT = make_search_plan(EPOCHS, seeds=_seeds, finals=fit_finals(float(budget_h.value), n_seeds=len(_seeds), epochs=EPOCHS))
