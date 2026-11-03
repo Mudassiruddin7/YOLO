@@ -4,8 +4,8 @@ One marimo notebook, `graft_p2_v2.py` (≈ 2,700 lines, 138 KB; v1 was 5,300 lin
 
 ## Run it on molab (RTX PRO 6000, 12 h)
 1. molab → new notebook → paste `https://github.com/Mudassiruddin7/YOLO/blob/main/graft_p2_v2.py` → notebook-specs button → **toggle the GPU**.
-2. Choose the session in the first cell (the default is A) and press **Run all**. Keep the tab open and the computer awake (≈ 8 h of training, budget slider 10 h).
-3. When the monitor says the worker has finished, **download `diagnostics.zip`** from the last cell before the session ends (molab deletes everything else).
+2. Choose the session, **paste your Hugging Face token** (write access to the dataset in the repo field; a password field, kept in memory only) and press **START**. The notebook checks the token before training and then pushes the results (leaderboard, every finished run's result.json, curves, final weights, saved predictions) to the dataset **every 20 minutes and after every finished run**, so a closed laptop or a molab shutdown costs at most the last 20 minutes. Revoke the token afterwards.
+3. Without a token the results live only on molab's disk (lost 90 min after the browser disconnects or at 12 h): download `diagnostics.zip` from the last cell before that.
 
 Three sessions, each self-contained (≈ 8 h):
 

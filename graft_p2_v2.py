@@ -15,6 +15,7 @@
 #     "tidecv",
 #     "psutil",
 #     "tqdm",
+#     "huggingface_hub",
 # ]
 # ///
 
@@ -1589,6 +1590,60 @@ def pid_alive(pid):
 
 
 @app.function
+def hf_check(repo, token, tag):
+    """Fail EARLY (before hours of training) if the Hugging Face token cannot write to the dataset repo.  The token is only ever read from the environment / a password field,
+    never written to a file, a log or the plan."""
+    try:
+        from huggingface_hub import HfApi
+    except ImportError:
+        pip_install(["huggingface_hub"])
+        from huggingface_hub import HfApi
+    api = HfApi(token=token)
+    try:
+        who = api.whoami()["name"]
+        try:
+            api.create_repo(repo, repo_type="dataset", exist_ok=True)
+        except Exception:
+            pass  # the repo exists already, or the token may not create repos but may still write to it
+        api.upload_file(path_or_fileobj=f"started {time.strftime('%Y-%m-%d %H:%M:%S')}\n".encode(), path_in_repo=f"{tag}/START.txt", repo_id=repo, repo_type="dataset")
+    except Exception as e:
+        raise RuntimeError(f"Hugging Face check failed for {repo}: {str(e).replace(token, '***')[:300]} (the token needs WRITE access to this dataset)")
+    return f"write access to dataset {repo} confirmed as '{who}'; results go to the folder '{tag}/'"
+
+
+@app.function
+def sync_to_hf(work, tag, repo, token, log_path=None):
+    """Push everything small and valuable of the work directory to a Hugging Face dataset repo (folder `tag`): results, leaderboard, status, logs, the per-run result files and
+    training curves, and - for FINISHED runs only - the final weights (6-20 MB) and the saved predictions.  Files that did not change are not uploaded again.  Never raises."""
+    if not (repo and token):
+        return "disabled"
+    work = Path(work)
+    try:
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            pip_install(["huggingface_hub"])
+            from huggingface_hub import HfApi
+        done = []
+        for rf in (work / "runs").glob("*/result.json"):
+            r = jload(rf, {})
+            if r.get("finished_at") and r.get("spec") and not rf.parent.name.startswith(("calib", "smoke")):
+                done.append(rf.parent.name)
+        allow = ["results/*", "status.json", "plan.json", "calibration.json", "environment_probe.json", "logs/worker.log", "logs/autopilot.log", "logs/smoke.log", "logs/calibrate.log",
+                 "runs/*/result.json", "runs/*/results.csv", "runs/*/train_info.json", "runs/*/args.yaml", "runs/*/state.json"]
+        for rid in done:
+            allow += [f"runs/{rid}/weights/last.pt", f"runs/{rid}/preds_*.npz"]
+        HfApi(token=token).upload_folder(folder_path=str(work), repo_id=repo, repo_type="dataset", path_in_repo=tag, allow_patterns=allow,
+                                         ignore_patterns=["runs/calib*/*", "runs/smoke*/*"], commit_message=f"{tag}: {len(done)} finished runs")
+        return f"uploaded ({len(done)} finished runs)"
+    except Exception as e:
+        msg = f"sync failed: {str(e).replace(token, '***')[:200]}"
+        if log_path:
+            log(msg, log_path)
+        return msg
+
+
+@app.function
 def worker_main(plan_path):
     """Scheduler: keeps `n_parallel` run_one() children alive, honours the deadline, writes status.json."""
     plan = jload(plan_path)
@@ -1630,6 +1685,8 @@ def worker_main(plan_path):
     waiting_logged: set = set()
     stagger_s = float(plan.get("stagger_s", 60.0))
     last_start = 0.0
+    hf_repo, hf_token, hf_tag = os.environ.get("GRAFT_HF_REPO", ""), os.environ.get("HF_TOKEN", ""), plan.get("hf_tag", "run")
+    last_sync = time.time()  # first sync after 20 minutes, then after every finished run and at least every 20 minutes
     while queue or running:
         # reap finished children
         for rid, (proc, spec, t0) in list(running.items()):
@@ -1657,6 +1714,7 @@ def worker_main(plan_path):
                     write_leaderboard(work)
                 except Exception as e:
                     log(f"leaderboard failed: {e!r}", lp)
+                last_sync = 0.0  # a run has finished: push it to Hugging Face on this pass
             elif time.time() > hard_deadline:
                 proc.terminate()
                 status[rid].update(state="killed (hard deadline)")
@@ -1714,6 +1772,9 @@ def worker_main(plan_path):
             status[spec.run_id].update(state="running", started=time.time(), est_s=est)
             log(f"started {spec.run_id} (est {fmt_hours(est)})", lp)
         write_status()
+        if hf_repo and hf_token and time.time() - last_sync > 1200:
+            last_sync = time.time()
+            log(f"hugging face sync: {sync_to_hf(work, hf_tag, hf_repo, hf_token, lp)}", lp)
         time.sleep(5)
     write_status()
     log("worker finished", lp)
@@ -1723,7 +1784,8 @@ def worker_main(plan_path):
                      ("sequential latency re-measurement (runs)", lambda: remeasure_latency(work, lp)),
                      ("leaderboard", lambda: write_leaderboard(work)[:0]),
                      ("contrasts with image-bootstrap intervals", lambda: headline_contrasts(work, B=int(plan.get("bootstrap_B", 200)), log_path=lp)),
-                     ("diagnostics zip", lambda: zip_diagnostics(work))):
+                     ("diagnostics zip", lambda: zip_diagnostics(work)),
+                     ("hugging face upload (final)", lambda: sync_to_hf(work, hf_tag, hf_repo, hf_token, lp))):
         try:
             log(f"{name}: {fn()}", lp)
         except Exception as e:
@@ -2310,12 +2372,12 @@ def install_cuda_torch(backend="cu128", dry_run=False, log=print):
 
 
 @app.function
-def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, notebook_file=None, bootstrap_B=200):
+def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, notebook_file=None, bootstrap_B=200, hf_tag=""):
     """The dict that worker_main() consumes."""
     now = time.time()
     plan = {"work": str(work), "specs": [asdict(s) for s in specs], "n_parallel": par["n_parallel"], "workers": par["workers"], "cache": cache, "device": None,
             "deadline": now + budget_h * 3600, "hard_deadline": now + min(budget_h * 3600 + 1800, 11.5 * 3600), "s_per_epoch": float(s_per_epoch),
-            "eval_s": 240.0, "gpu_gb": float(par.get("gpu_gb") or 0.0), "tide": True, "test_dev": limit is None, "bootstrap_B": int(bootstrap_B)}
+            "eval_s": 240.0, "gpu_gb": float(par.get("gpu_gb") or 0.0), "tide": True, "test_dev": limit is None, "bootstrap_B": int(bootstrap_B), "hf_tag": hf_tag}
     if limit is not None:
         plan.update(limit=limit, data_suffix=f"_lim{limit}")
     if notebook_file:
@@ -2325,7 +2387,7 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
 
 @app.function
 def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None,
-              log_path=None, launch=True, recalibrate=False):
+              log_path=None, launch=True, recalibrate=False, hf_repo="", hf_token=""):
     """Everything between an EMPTY work directory and a RUNNING training worker, in one call.  Idempotent: finished parts are skipped.  `limit` runs it on a tiny subset (test mode).
     Returns {"ok": bool, "steps": [{step, ok, seconds, detail}], "plan": dict | None, "pid": int | None}."""
     work = Path(work)
@@ -2364,6 +2426,14 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
 
     if not step("environment check / repair", environment):
         return fail()
+    hf_repo, hf_token = (hf_repo or "").strip(), (hf_token or "").strip()
+    hf_tag = f"session{session}-{time.strftime('%Y%m%d-%H%M')}"
+    old_plan = jload(work / "plan.json", {})
+    if old_plan.get("hf_tag") and (work / "runs").exists() and any((work / "runs").glob("*/result.json")):
+        hf_tag = old_plan["hf_tag"]  # a restarted autopilot continues in the same folder
+    if hf_repo and hf_token:
+        if not step("Hugging Face access (results are pushed there during the run)", lambda: hf_check(hf_repo, hf_token, hf_tag)):
+            return fail()
     specs = make_plan_v2(session, epochs=int(epochs))
     if limit is not None:
         specs = [dataclasses.replace(s, epochs=1, batch=8, imgsz=min(s.imgsz, 320), eval_sizes=()) for s in specs[:2]]
@@ -2412,7 +2482,7 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
     elif limit is None:
         spe = float((jload(work / "calibration.json", {}) or {}).get("s_per_epoch", 60.0))
     cache = choose_cache(par["n_parallel"], need_gb=9.0 * (max(s.imgsz for s in specs if s.imgsz <= 960) / 640.0) ** 2) if any(s.imgsz <= 960 for s in specs) else False
-    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb)
+    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb, hf_tag=hf_tag)
     jdump(plan, work / "plan_preview.json")
     summary = f"session {session}: {len(specs)} runs, {spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}"
     steps.append({"step": "plan", "ok": True, "seconds": 0.0, "detail": summary})
@@ -2433,7 +2503,7 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
         strays = stray_run_pids(work)
         if strays:
             raise RuntimeError(f"training processes of an earlier worker are still alive: {strays}")
-        state["pid"] = launch_worker(work, plan, notebook_file=str(nb))
+        state["pid"] = launch_worker(work, plan, notebook_file=str(nb), extra_env=({"HF_TOKEN": hf_token, "GRAFT_HF_REPO": hf_repo} if (hf_repo and hf_token) else {}))
         return f"worker started, pid {state['pid']} ({summary})"
     if not step("launch the background worker", go):
         return fail()
@@ -2602,10 +2672,12 @@ def _(mo):
                                          "Session C - second model scale: YOLOv10s, 3 seeds (about 8 h)": "C"},
                                 value="Session A - seeds: 896 px, 3 seeds each (about 8 h)", label="What to run", full_width=True)
     budget_h = mo.ui.slider(2.0, 10.0, value=10.0, step=0.5, show_value=True, label="Budget for training + evaluation (hours from the launch; the 12 h session also needs ~1 h of set-up and ~0.5 h of final analysis)")
-    auto_ok = mo.ui.checkbox(value=True, label="Start automatically when the notebook is run (Run all)")
-    auto_btn = mo.ui.run_button(label="Start (if the box above is not ticked)")
-    mo.vstack([mo.md("## Settings"), work_input, session_ui, budget_h, auto_ok, auto_btn])
-    return auto_btn, auto_ok, budget_h, session_ui, work_input
+    hf_repo = mo.ui.text(value="mudassiruddin/yolo", label="Hugging Face DATASET repo that receives the results during the run (user/name)", full_width=True)
+    hf_token = mo.ui.text(value="", kind="password", label="Hugging Face token with WRITE access to that dataset (kept in memory only: never written to a file or a log; revoke it afterwards)", full_width=True)
+    auto_ok = mo.ui.checkbox(value=False, label="Start automatically when the notebook is run (Run all) - only sensible with an EMPTY token field")
+    auto_btn = mo.ui.run_button(label="START (paste the token first)")
+    mo.vstack([mo.md("## Settings"), work_input, session_ui, budget_h, hf_repo, hf_token, auto_ok, auto_btn])
+    return auto_btn, auto_ok, budget_h, hf_repo, hf_token, session_ui, work_input
 
 
 @app.cell
@@ -2616,12 +2688,15 @@ def _(work_input):
 
 
 @app.cell
-def _(WORK, auto_btn, auto_ok, budget_h, mo, session_ui):
-    mo.stop(not (auto_ok.value or auto_btn.value), mo.md("*Not started. Tick the box or press the button.*"))
+def _(WORK, auto_btn, auto_ok, budget_h, hf_repo, hf_token, mo, session_ui):
+    mo.stop(not (auto_ok.value or auto_btn.value), mo.md("*Not started. Paste the Hugging Face token, then press START.*"))
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_v2.py")
-    AUTO = autopilot(WORK, session=session_ui.value, budget_h=float(budget_h.value), notebook_file=str(_nb), log_path=WORK / "logs" / "autopilot.log")
+    AUTO = autopilot(WORK, session=session_ui.value, budget_h=float(budget_h.value), notebook_file=str(_nb), log_path=WORK / "logs" / "autopilot.log",
+                     hf_repo=hf_repo.value, hf_token=hf_token.value)
     _lines = [f"- {'✅' if s['ok'] else '❌'} **{s['step']}** ({s['seconds']} s): `{str(s['detail'])[:500]}`" for s in AUTO["steps"]]
-    mo.vstack([mo.callout(mo.md("**The worker is running — follow it below.**" if AUTO["ok"] else "**Stopped at a failed step** — read the last line; pressing Start again resumes."),
+    _nohf = not (hf_repo.value.strip() and hf_token.value.strip())
+    mo.vstack([mo.callout(mo.md("**No Hugging Face token: results exist only on molab's disk and are lost if the session ends. Stop and paste a token if you will not be here.**"), kind="warn") if _nohf else mo.md(""),
+               mo.callout(mo.md("**The worker is running — follow it below.**" if AUTO["ok"] else "**Stopped at a failed step** — read the last line; pressing Start again resumes."),
                           kind="success" if AUTO["ok"] else "danger"), mo.md("\n".join(_lines))])
     return (AUTO,)
 
