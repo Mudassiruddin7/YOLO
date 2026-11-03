@@ -63,6 +63,7 @@ with app.setup:
     except NameError:  # pragma: no cover
         NOTEBOOK_FILE = None
 
+    HF_PUSHED = {}  # run id -> time of the last checkpoint push of this process
     CLASS_NAMES = [
         "pedestrian", "people", "bicycle", "car", "van",
         "truck", "tricycle", "awning-tricycle", "bus", "motor",
@@ -969,6 +970,42 @@ def stray_run_pids(work):
 
 
 @app.function
+def push_checkpoint(work, run_id, epoch, log_path=None, min_interval=600.0):
+    """Called by the training process right after Ultralytics has SAVED a checkpoint (so the file is consistent): at most every `min_interval` seconds it copies last.pt (+ the
+    training curve) to a staging folder, checks that the checkpoint is an intact zip archive and pushes it to the Hugging Face dataset folder of this session.  The environment
+    carries the repo, the folder and the token (set by the autopilot).  Never raises: a failed push must not cost a training run."""
+    repo, token, tag = os.environ.get("GRAFT_HF_REPO", ""), os.environ.get("HF_TOKEN", ""), os.environ.get("GRAFT_HF_TAG", "")
+    if not (repo and token and tag):
+        return False
+    now = time.time()
+    if now - HF_PUSHED.get(run_id, 0.0) < min_interval:
+        return False
+    HF_PUSHED[run_id] = now
+    try:
+        from huggingface_hub import HfApi
+        rdir = Path(work) / "runs" / run_id
+        stage = Path(work) / "_hf_stage" / run_id
+        shutil.rmtree(stage, ignore_errors=True)
+        (stage / "weights").mkdir(parents=True)
+        shutil.copy2(rdir / "weights" / "last.pt", stage / "weights" / "last.pt")
+        with zipfile.ZipFile(stage / "weights" / "last.pt") as z:
+            if z.testzip() is not None:
+                raise RuntimeError("checkpoint is not an intact archive")
+        for f in ("results.csv", "args.yaml"):
+            if (rdir / f).exists():
+                shutil.copy2(rdir / f, stage / f)
+        HfApi(token=token).upload_folder(folder_path=str(stage), repo_id=repo, repo_type="dataset", path_in_repo=f"{tag}/runs/{run_id}",
+                                         commit_message=f"{run_id}: checkpoint after epoch {epoch}")
+        shutil.rmtree(stage, ignore_errors=True)
+        log(f"[{run_id}] checkpoint of epoch {epoch} pushed to Hugging Face", log_path)
+        return True
+    except Exception as e:
+        HF_PUSHED[run_id] = now - min_interval + 120.0  # try again in 2 minutes
+        log(f"[{run_id}] checkpoint push failed: {str(e).replace(token, '***')[:200]}", log_path)
+        return False
+
+
+@app.function
 def run_training(work, spec, workers=8, cache=False, device=None, fraction=1.0, data_suffix="", log_path=None):
     """Train one RunSpec with Ultralytics.  Returns a dict with paths, transfer accounting and timing."""
     import torch
@@ -990,6 +1027,7 @@ def run_training(work, spec, workers=8, cache=False, device=None, fraction=1.0, 
 
     y = YOLO(str(ycfg))
     y.add_callback("on_train_epoch_end", on_epoch_end)
+    y.add_callback("on_model_save", lambda trainer: push_checkpoint(work, spec.run_id, int(trainer.epoch) + 1, log_path))
     args = dict(
         data=str(data_yaml), epochs=spec.epochs, imgsz=spec.imgsz, batch=spec.batch, nbs=64, device=device, workers=workers,
         seed=spec.seed, deterministic=False, optimizer="SGD", lr0=0.01, lrf=0.01, momentum=0.937, weight_decay=0.0005,
@@ -1525,7 +1563,9 @@ def resume_training(work, spec, workers=8, cache=False, device=None, data_suffix
     restore = apply_tal_floor(spec.floor)
     t0 = time.time()
     try:
-        YOLO(str(rdir / "weights" / "last.pt")).train(trainer=Trainer, resume=True)
+        y = YOLO(str(rdir / "weights" / "last.pt"))
+        y.add_callback("on_model_save", lambda trainer: push_checkpoint(work, spec.run_id, int(trainer.epoch) + 1, rdir.parent.parent / "logs" / f"{spec.run_id}.log"))
+        y.train(trainer=Trainer, resume=True)
     finally:
         restore()
     info = {"run_dir": str(rdir), "last": str(rdir / "weights" / "last.pt"), "train_wall_s": time.time() - t0, "epoch_times_s": [],
@@ -1656,12 +1696,18 @@ def sync_to_hf(work, tag, repo, token, log_path=None):
                 done.append(rf.parent.name)
         allow = ["results/*", "status.json", "plan.json", "calibration.json", "environment_probe.json", "logs/worker.log", "logs/autopilot.log", "logs/smoke.log", "logs/calibrate.log",
                  "runs/*/result.json", "runs/*/results.csv", "runs/*/train_info.json", "runs/*/args.yaml", "runs/*/state.json"]
-        allow += ["runs/*/weights/last.pt"]  # also the checkpoints of RUNNING runs (about 7 MB each): a new session can resume them (hf_restore)
-        for rid in done:
-            allow += [f"runs/{rid}/preds_*.npz"]
-        HfApi(token=token).upload_folder(folder_path=str(work), repo_id=repo, repo_type="dataset", path_in_repo=tag, allow_patterns=allow,
-                                         ignore_patterns=["runs/calib*/*", "runs/smoke*/*"], commit_message=f"{tag}: {len(done)} finished runs")
-        return f"uploaded ({len(done)} finished runs)"
+        for rid in done:  # (the checkpoints of RUNNING runs are pushed by the training processes themselves, right after each save: push_checkpoint)
+            allow += [f"runs/{rid}/weights/last.pt", f"runs/{rid}/preds_*.npz"]
+        api = HfApi(token=token)
+        api.upload_folder(folder_path=str(work), repo_id=repo, repo_type="dataset", path_in_repo=tag, allow_patterns=allow,
+                          ignore_patterns=["runs/calib*/*", "runs/smoke*/*"], commit_message=f"{tag}: {len(done)} finished runs")
+        # verify: every finished run's result file, weights and results folder must now be on the hub
+        remote = {f.path for f in api.list_repo_tree(repo, path_in_repo=tag, recursive=True, repo_type="dataset") if hasattr(f, "size")}
+        need = [f"{tag}/runs/{rid}/result.json" for rid in done] + [f"{tag}/runs/{rid}/weights/last.pt" for rid in done] + [f"{tag}/results/leaderboard.csv"]
+        missing = [n for n in need if n not in remote]
+        if missing:
+            return f"UPLOADED BUT NOT VERIFIED, missing on the hub: {missing[:4]}"
+        return f"uploaded and verified on the hub ({len(done)} finished runs, {len(remote)} files)"
     except Exception as e:
         msg = f"sync failed: {str(e).replace(token, '***')[:200]}"
         if log_path:
@@ -1712,7 +1758,7 @@ def worker_main(plan_path):
     stagger_s = float(plan.get("stagger_s", 60.0))
     last_start = 0.0
     hf_repo, hf_token, hf_tag = os.environ.get("GRAFT_HF_REPO", ""), os.environ.get("HF_TOKEN", ""), plan.get("hf_tag", "run")
-    last_sync = time.time()  # first sync after 20 minutes, then after every finished run and at least every 20 minutes
+    last_sync = time.time()  # first sync after 10 minutes, then after every finished run and at least every 10 minutes
     while queue or running:
         # reap finished children
         for rid, (proc, spec, t0) in list(running.items()):
@@ -1798,7 +1844,7 @@ def worker_main(plan_path):
             status[spec.run_id].update(state="running", started=time.time(), est_s=est)
             log(f"started {spec.run_id} (est {fmt_hours(est)})", lp)
         write_status()
-        if hf_repo and hf_token and time.time() - last_sync > 1200:
+        if hf_repo and hf_token and time.time() - last_sync > 600:
             last_sync = time.time()
             log(f"hugging face sync: {sync_to_hf(work, hf_tag, hf_repo, hf_token, lp)}", lp)
         time.sleep(5)
@@ -2535,7 +2581,7 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
         strays = stray_run_pids(work)
         if strays:
             raise RuntimeError(f"training processes of an earlier worker are still alive: {strays}")
-        state["pid"] = launch_worker(work, plan, notebook_file=str(nb), extra_env=({"HF_TOKEN": hf_token, "GRAFT_HF_REPO": hf_repo} if (hf_repo and hf_token) else {}))
+        state["pid"] = launch_worker(work, plan, notebook_file=str(nb), extra_env=({"HF_TOKEN": hf_token, "GRAFT_HF_REPO": hf_repo, "GRAFT_HF_TAG": hf_tag} if (hf_repo and hf_token) else {}))
         return f"worker started, pid {state['pid']} ({summary})"
     if not step("launch the background worker", go):
         return fail()
