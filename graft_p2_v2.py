@@ -1612,9 +1612,34 @@ def hf_check(repo, token, tag):
 
 
 @app.function
+def hf_restore(repo, tag, work, token=""):
+    """Bring a dead session back: download the finished runs' results and every run's latest checkpoint from the folder `tag` of the dataset into this work directory.  Finished runs are
+    then skipped, partly trained runs resume from their last epoch (run_one -> resume_training; a damaged checkpoint falls back to a fresh start)."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError:
+        pip_install(["huggingface_hub"])
+        from huggingface_hub import snapshot_download
+    work = Path(work)
+    tmp = work / "_hf_restore"
+    shutil.rmtree(tmp, ignore_errors=True)
+    snapshot_download(repo_id=repo, repo_type="dataset", local_dir=str(tmp), token=token or None,
+                      allow_patterns=[f"{tag}/runs/*/result.json", f"{tag}/runs/*/train_info.json", f"{tag}/runs/*/results.csv", f"{tag}/runs/*/args.yaml",
+                                      f"{tag}/runs/*/weights/last.pt", f"{tag}/runs/*/preds_*.npz"])
+    src = tmp / tag / "runs"
+    if not src.exists():
+        raise RuntimeError(f"folder '{tag}' of {repo} has no runs to restore")
+    shutil.copytree(src, work / "runs", dirs_exist_ok=True)
+    shutil.rmtree(tmp, ignore_errors=True)
+    fin = [r.parent.name for r in (work / "runs").glob("*/result.json") if jload(r, {}).get("finished_at")]
+    part = [d.parent.parent.name for d in (work / "runs").glob("*/weights/last.pt") if d.parent.parent.name not in fin]
+    return f"restored {len(fin)} finished runs and {len(part)} partly trained runs ({', '.join(part) or '-'})"
+
+
+@app.function
 def sync_to_hf(work, tag, repo, token, log_path=None):
     """Push everything small and valuable of the work directory to a Hugging Face dataset repo (folder `tag`): results, leaderboard, status, logs, the per-run result files and
-    training curves, and - for FINISHED runs only - the final weights (6-20 MB) and the saved predictions.  Files that did not change are not uploaded again.  Never raises."""
+    training curves, the latest checkpoint of every run (running ones too: a dead session can be resumed from them) and - for FINISHED runs only - the saved predictions.  Files that did not change are not uploaded again.  Never raises."""
     if not (repo and token):
         return "disabled"
     work = Path(work)
@@ -1631,8 +1656,9 @@ def sync_to_hf(work, tag, repo, token, log_path=None):
                 done.append(rf.parent.name)
         allow = ["results/*", "status.json", "plan.json", "calibration.json", "environment_probe.json", "logs/worker.log", "logs/autopilot.log", "logs/smoke.log", "logs/calibrate.log",
                  "runs/*/result.json", "runs/*/results.csv", "runs/*/train_info.json", "runs/*/args.yaml", "runs/*/state.json"]
+        allow += ["runs/*/weights/last.pt"]  # also the checkpoints of RUNNING runs (about 7 MB each): a new session can resume them (hf_restore)
         for rid in done:
-            allow += [f"runs/{rid}/weights/last.pt", f"runs/{rid}/preds_*.npz"]
+            allow += [f"runs/{rid}/preds_*.npz"]
         HfApi(token=token).upload_folder(folder_path=str(work), repo_id=repo, repo_type="dataset", path_in_repo=tag, allow_patterns=allow,
                                          ignore_patterns=["runs/calib*/*", "runs/smoke*/*"], commit_message=f"{tag}: {len(done)} finished runs")
         return f"uploaded ({len(done)} finished runs)"
@@ -2387,7 +2413,7 @@ def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None,
 
 @app.function
 def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, skip_smoke=False, skip_calibration=False, need_cuda=True, limit=None,
-              log_path=None, launch=True, recalibrate=False, hf_repo="", hf_token=""):
+              log_path=None, launch=True, recalibrate=False, hf_repo="", hf_token="", hf_resume=""):
     """Everything between an EMPTY work directory and a RUNNING training worker, in one call.  Idempotent: finished parts are skipped.  `limit` runs it on a tiny subset (test mode).
     Returns {"ok": bool, "steps": [{step, ok, seconds, detail}], "plan": dict | None, "pid": int | None}."""
     work = Path(work)
@@ -2431,8 +2457,14 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
     old_plan = jload(work / "plan.json", {})
     if old_plan.get("hf_tag") and (work / "runs").exists() and any((work / "runs").glob("*/result.json")):
         hf_tag = old_plan["hf_tag"]  # a restarted autopilot continues in the same folder
+    hf_resume = (hf_resume or "").strip().strip("/")
+    if hf_resume:
+        hf_tag = hf_resume  # continue in the same folder
     if hf_repo and hf_token:
         if not step("Hugging Face access (results are pushed there during the run)", lambda: hf_check(hf_repo, hf_token, hf_tag)):
+            return fail()
+    if hf_resume and hf_repo:
+        if not step(f"restore the session '{hf_resume}' from Hugging Face", lambda: hf_restore(hf_repo, hf_resume, work, hf_token)):
             return fail()
     specs = make_plan_v2(session, epochs=int(epochs))
     if limit is not None:
@@ -2674,10 +2706,11 @@ def _(mo):
     budget_h = mo.ui.slider(2.0, 10.0, value=10.0, step=0.5, show_value=True, label="Budget for training + evaluation (hours from the launch; the 12 h session also needs ~1 h of set-up and ~0.5 h of final analysis)")
     hf_repo = mo.ui.text(value="mudassiruddin/yolo", label="Hugging Face DATASET repo that receives the results during the run (user/name)", full_width=True)
     hf_token = mo.ui.text(value="", kind="password", label="Hugging Face token with WRITE access to that dataset (kept in memory only: never written to a file or a log; revoke it afterwards)", full_width=True)
+    hf_resume = mo.ui.text(value="", label="RESUME a dead session: its folder name in the dataset (e.g. sessionA-20261103-0052). Empty = fresh start. Finished runs are skipped, partly trained runs continue from their last checkpoint.", full_width=True)
     auto_ok = mo.ui.checkbox(value=False, label="Start automatically when the notebook is run (Run all) - only sensible with an EMPTY token field")
     auto_btn = mo.ui.run_button(label="START (paste the token first)")
-    mo.vstack([mo.md("## Settings"), work_input, session_ui, budget_h, hf_repo, hf_token, auto_ok, auto_btn])
-    return auto_btn, auto_ok, budget_h, hf_repo, hf_token, session_ui, work_input
+    mo.vstack([mo.md("## Settings"), work_input, session_ui, budget_h, hf_repo, hf_token, hf_resume, auto_ok, auto_btn])
+    return auto_btn, auto_ok, budget_h, hf_repo, hf_resume, hf_token, session_ui, work_input
 
 
 @app.cell
@@ -2688,11 +2721,11 @@ def _(work_input):
 
 
 @app.cell
-def _(WORK, auto_btn, auto_ok, budget_h, hf_repo, hf_token, mo, session_ui):
+def _(WORK, auto_btn, auto_ok, budget_h, hf_repo, hf_resume, hf_token, mo, session_ui):
     mo.stop(not (auto_ok.value or auto_btn.value), mo.md("*Not started. Paste the Hugging Face token, then press START.*"))
     _nb = NOTEBOOK_FILE or Path(mo.notebook_location() / "graft_p2_v2.py")
     AUTO = autopilot(WORK, session=session_ui.value, budget_h=float(budget_h.value), notebook_file=str(_nb), log_path=WORK / "logs" / "autopilot.log",
-                     hf_repo=hf_repo.value, hf_token=hf_token.value)
+                     hf_repo=hf_repo.value, hf_token=hf_token.value, hf_resume=hf_resume.value)
     _lines = [f"- {'✅' if s['ok'] else '❌'} **{s['step']}** ({s['seconds']} s): `{str(s['detail'])[:500]}`" for s in AUTO["steps"]]
     _nohf = not (hf_repo.value.strip() and hf_token.value.strip())
     mo.vstack([mo.callout(mo.md("**No Hugging Face token: results exist only on molab's disk and are lost if the session ends. Stop and paste a token if you will not be here.**"), kind="warn") if _nohf else mo.md(""),
