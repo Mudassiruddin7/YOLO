@@ -1760,7 +1760,28 @@ def worker_main(plan_path):
     last_start = 0.0
     hf_repo, hf_token, hf_tag = os.environ.get("GRAFT_HF_REPO", ""), os.environ.get("HF_TOKEN", ""), plan.get("hf_tag", "run")
     last_sync = time.time()  # first sync after 10 minutes, then after every finished run and at least every 10 minutes
+    partial_ok = bool(plan.get("partial_ok"))  # short session (molab stopped sessions after ~3 h): runs that do not fit are PAUSED at the deadline and resumed in the next session
+    queue.sort(key=lambda sp_: 0 if (work / "runs" / sp_.run_id / "weights" / "last.pt").exists() else 1)  # partly trained runs first (stable: priorities are kept otherwise)
     while queue or running:
+        if partial_ok and time.time() > deadline:
+            log("session budget reached: pausing the running runs (their checkpoints go to the hub; start the next session with RESUME)", lp)
+            for rid_, (proc_, sp_, t0_) in list(running.items()):
+                try:
+                    proc_.terminate()
+                    proc_.wait(timeout=60)
+                except Exception:
+                    try:
+                        proc_.kill()
+                    except Exception:
+                        pass
+                if hf_repo and hf_token:
+                    push_checkpoint(work, rid_, 0, lp, min_interval=0.0)  # (after the process has stopped: the file is stable)
+                status[rid_].update(state="paused (resume in the next session)")
+            for sp_ in queue:
+                status[sp_.run_id]["state"] = "not started (next session)"
+            running.clear()
+            queue.clear()
+            break
         # reap finished children
         for rid, (proc, spec, t0) in list(running.items()):
             rc = proc.poll()
@@ -1827,7 +1848,7 @@ def worker_main(plan_path):
                 break
             spec = queue[idx]
             est = estimate_run_seconds(spec, s_per_epoch, plan.get("eval_s", 240.0), ratio) * (1.0 + 0.15 * max(0, len(running)))
-            if time.time() + est > deadline:
+            if time.time() + est > deadline and not partial_ok:
                 status[spec.run_id]["state"] = "skipped (would exceed time budget)"
                 queue.pop(idx)
                 log(f"skip {spec.run_id}: est {fmt_hours(est)} exceeds remaining {fmt_hours(deadline - time.time())}", lp)
@@ -2445,12 +2466,12 @@ def install_cuda_torch(backend="cu128", dry_run=False, log=print):
 
 
 @app.function
-def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, notebook_file=None, bootstrap_B=200, hf_tag=""):
+def make_worker_plan(work, specs, par, cache, budget_h, s_per_epoch, limit=None, notebook_file=None, bootstrap_B=200, hf_tag="", partial_ok=False):
     """The dict that worker_main() consumes."""
     now = time.time()
     plan = {"work": str(work), "specs": [asdict(s) for s in specs], "n_parallel": par["n_parallel"], "workers": par["workers"], "cache": cache, "device": None,
             "deadline": now + budget_h * 3600, "hard_deadline": now + min(budget_h * 3600 + 1800, 11.5 * 3600), "s_per_epoch": float(s_per_epoch),
-            "eval_s": 240.0, "gpu_gb": float(par.get("gpu_gb") or 0.0), "tide": True, "test_dev": limit is None, "bootstrap_B": int(bootstrap_B), "hf_tag": hf_tag}
+            "eval_s": 240.0, "gpu_gb": float(par.get("gpu_gb") or 0.0), "tide": True, "test_dev": limit is None, "bootstrap_B": int(bootstrap_B), "hf_tag": hf_tag, "partial_ok": bool(partial_ok)}
     if limit is not None:
         plan.update(limit=limit, data_suffix=f"_lim{limit}")
     if notebook_file:
@@ -2561,7 +2582,7 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
     elif limit is None:
         spe = float((jload(work / "calibration.json", {}) or {}).get("s_per_epoch", 60.0))
     cache = choose_cache(par["n_parallel"], need_gb=9.0 * (max(s.imgsz for s in specs if s.imgsz <= 960) / 640.0) ** 2) if any(s.imgsz <= 960 for s in specs) else False
-    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb, hf_tag=hf_tag)
+    plan = make_worker_plan(work, specs, par, cache, budget_h, spe, limit=limit, notebook_file=nb, hf_tag=hf_tag, partial_ok=(budget_h <= 6.0))
     jdump(plan, work / "plan_preview.json")
     summary = f"session {session}: {len(specs)} runs, {spe:.0f} s/epoch, {par['n_parallel']} parallel x {par['workers']} loader workers, cache={cache}"
     steps.append({"step": "plan", "ok": True, "seconds": 0.0, "detail": summary})
@@ -2750,7 +2771,7 @@ def _(mo):
     session_ui = mo.ui.dropdown(options={"Session A - seeds: 896 px, 3 seeds each (about 8 h)": "A", "Session B - best resolution: 1280 px and a 150-epoch schedule (about 8 h)": "B",
                                          "Session C - second model scale: YOLOv10s, 3 seeds (about 8 h)": "C"},
                                 value="Session A - seeds: 896 px, 3 seeds each (about 8 h)", label="What to run", full_width=True)
-    budget_h = mo.ui.slider(2.0, 10.0, value=10.0, step=0.5, show_value=True, label="Budget for training + evaluation (hours from the launch; the 12 h session also needs ~1 h of set-up and ~0.5 h of final analysis)")
+    budget_h = mo.ui.slider(1.0, 10.0, value=2.5, step=0.5, show_value=True, label="Hours of training in THIS session, counted from the launch. molab has stopped sessions after about 3 h three times in a row, so the default is 2.5 h (the rest of the ~3 h is set-up and the final steps). At the end the unfinished runs are paused and pushed to the hub; start the next session with RESUME.")
     hf_repo = mo.ui.text(value="mudassiruddin/yolo", label="Hugging Face DATASET repo that receives the results during the run (user/name)", full_width=True)
     hf_token = mo.ui.text(value="", kind="password", label="Hugging Face token with WRITE access to that dataset (kept in memory only: never written to a file or a log; revoke it afterwards)", full_width=True)
     hf_resume = mo.ui.text(value="", label="RESUME a dead session: its folder name in the dataset (e.g. sessionA-20261103-0052). Empty = fresh start. Finished runs are skipped, partly trained runs continue from their last checkpoint.", full_width=True)
