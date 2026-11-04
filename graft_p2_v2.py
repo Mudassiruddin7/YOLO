@@ -1464,7 +1464,8 @@ def cost_factor(spec):
     f = {"graft": 1.12, "graftd": 1.15, "graftd3": 1.18, "naive": 1.12, "replace": 1.12}.get(spec.variant)
     if f is None:
         f = 1.06 if spec.variant.startswith("inj") else (1.12 if spec.variant.startswith("assist") else 1.0)
-    return (spec.imgsz / 640.0) ** 2 * f * (2.0 if spec.family == "v10s" else 1.0)
+    # a smaller batch is slower per epoch (measured: four-level model at 896 px, batch 16 = 203 s/epoch vs 140 s at batch 32)
+    return (spec.imgsz / 640.0) ** 2 * f * (2.0 if spec.family == "v10s" else 1.0) * {32: 1.0, 16: 1.45, 8: 2.0}.get(spec.batch, 1.0)
 
 
 @app.function
@@ -1703,7 +1704,7 @@ def sync_to_hf(work, tag, repo, token, log_path=None):
                           ignore_patterns=["runs/calib*/*", "runs/smoke*/*"], commit_message=f"{tag}: {len(done)} finished runs")
         # verify: every finished run's result file, weights and results folder must now be on the hub
         remote = {f.path for f in api.list_repo_tree(repo, path_in_repo=tag, recursive=True, repo_type="dataset") if hasattr(f, "size")}
-        need = [f"{tag}/runs/{rid}/result.json" for rid in done] + [f"{tag}/runs/{rid}/weights/last.pt" for rid in done] + [f"{tag}/results/leaderboard.csv"]
+        need = [f"{tag}/runs/{rid}/result.json" for rid in done] + [f"{tag}/runs/{rid}/weights/last.pt" for rid in done] + ([f"{tag}/results/leaderboard.csv"] if done else [])
         missing = [n for n in need if n not in remote]
         if missing:
             return f"UPLOADED BUT NOT VERIFIED, missing on the hub: {missing[:4]}"
