@@ -1566,6 +1566,7 @@ def resume_training(work, spec, workers=8, cache=False, device=None, data_suffix
     work = Path(work)
     rdir = work / "runs" / spec.run_id
     device = device if device is not None else (0 if torch.cuda.is_available() else "cpu")
+    write_data_yaml(work, spec.imgsz, limit_suffix=data_suffix)  # the dataset yaml of a NEW session does not exist yet (the checkpoint only stores its path): this was why every resume failed
     Trainer = make_trainer_class()
     Trainer.opts = {"variant": spec.variant, "transfer": spec.transfer, "base_cfg": load_base_cfg(spec.family)}
     restore = apply_tal_floor(spec.floor)
