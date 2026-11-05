@@ -1518,12 +1518,19 @@ def run_one(work, spec_dict, workers=8, cache=False, device=None, data_suffix=""
             # resume a partially trained run if possible, otherwise start from scratch
             last = rdir / "weights" / "last.pt"
             if last.exists():
-                try:
-                    info = resume_training(work, spec, workers=workers, cache=cache, device=device, data_suffix=data_suffix, log_path=lp)
-                except Exception as e:
-                    log(f"[{spec.run_id}] resume failed ({e!r}); restarting from scratch", lp)
+                for attempt_ in range(2):  # a transient failure (GPU busy, a file still being written) must not cost hours: try twice before giving up on the checkpoint
+                    try:
+                        info = resume_training(work, spec, workers=workers, cache=cache, device=device, data_suffix=data_suffix, log_path=lp)
+                        break
+                    except Exception as e:
+                        msg_ = f"[{spec.run_id}] resume attempt {attempt_ + 1} failed: {e!r}\n{traceback.format_exc()[-1500:]}"
+                        log(msg_, lp)
+                        log(msg_, work / "logs" / "resume_errors.log")  # (uploaded to the hub)
+                        release_gpu_memory()
+                        time.sleep(30)
+                if info is None:
+                    log(f"[{spec.run_id}] resume failed twice; restarting from scratch", lp)
                     shutil.rmtree(rdir, ignore_errors=True)
-                    info = None
             if info is None:
                 batch = spec.batch
                 for attempt in range(3):
@@ -1695,7 +1702,7 @@ def sync_to_hf(work, tag, repo, token, log_path=None):
             r = jload(rf, {})
             if r.get("finished_at") and r.get("spec") and not rf.parent.name.startswith(("calib", "smoke")):
                 done.append(rf.parent.name)
-        allow = ["results/*", "status.json", "plan.json", "calibration.json", "environment_probe.json", "logs/worker.log", "logs/autopilot.log", "logs/smoke.log", "logs/calibrate.log",
+        allow = ["results/*", "status.json", "plan.json", "calibration.json", "environment_probe.json", "logs/worker.log", "logs/autopilot.log", "logs/smoke.log", "logs/calibrate.log", "logs/resume_errors.log", "logs/v10*.log",
                  "runs/*/result.json", "runs/*/results.csv", "runs/*/train_info.json", "runs/*/args.yaml", "runs/*/state.json"]
         for rid in done:  # (the checkpoints of RUNNING runs are pushed by the training processes themselves, right after each save: push_checkpoint)
             allow += [f"runs/{rid}/weights/last.pt", f"runs/{rid}/preds_*.npz"]
