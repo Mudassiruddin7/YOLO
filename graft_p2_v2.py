@@ -2657,13 +2657,12 @@ def bigger_eval_sizes(imgsz):
 
 @app.function
 def default_batch(family, variant, imgsz):
-    """Batch size per run (the nominal batch stays 64 through gradient accumulation).  The four-level models need about 37 GB at batch 32 and 640 px and grow with the pixel
-    count (76 GB at 896 px), so they use batch 16 from 896 px and batch 8 from 1280 px; everything else uses 32.  (A different batch changes the batch-norm statistics slightly:
-    compare runs only within one session / one batch policy.)"""
-    graft_like = variant.startswith(("graft", "assist"))
-    if graft_like and imgsz >= 1280:
+    """Batch size per run (the nominal batch stays 64 through gradient accumulation).  The four-level model needs about 37 GB at batch 32 and 640 px and grows with the pixel
+    count, so from 896 px (and for YOLOv10s) the batch is 16 and from 1280 px it is 8.  The batch is the SAME for every variant of a given size and family, so that a comparison is
+    never confounded by it (session A compared batch 32 baselines with batch 16 models: a handicap for the model; a single pair suggests it costs about 0.8 test-dev AP)."""
+    if imgsz >= 1280:
         return 8
-    if graft_like and (imgsz >= 896 or family == "v10s"):
+    if imgsz >= 896 or family == "v10s":
         return 16
     return 32
 
@@ -2680,18 +2679,19 @@ def make_plan_v2(session="A", epochs=90, long_epochs=150, family="v10"):
     M = ("graftd", "role_ws", "ws", "P2-Graft deep, warm-started")
     B = ("base", "role", "f16", "YOLOv10 baseline")
 
-    def add(model, fam, seed, imgsz=640, ep=epochs, notes=""):
+    def add(model, fam, seed, imgsz=640, ep=epochs, notes="", batch=None):
         variant, transfer, tag, lab = model
-        rid = run_id_for(fam, variant, f"{tag}-{imgsz}-e{ep}", seed)
+        rid = run_id_for(fam, variant, f"{tag}-{imgsz}-e{ep}" + (f"-b{batch}" if batch else ""), seed)
         if any(x.run_id == rid for x in P):
             return
         P.append(RunSpec(run_id=rid, group=f"{lab}, {fam}, {imgsz} px, {ep} ep", family=fam, variant=variant, transfer=transfer, seed=seed, epochs=ep, imgsz=imgsz, floor=16,
-                         batch=default_batch(fam, variant, imgsz), tier={"A": 1, "B": 2, "C": 3}[session], eval_sizes=bigger_eval_sizes(imgsz), notes=notes))
+                         batch=batch or default_batch(fam, variant, imgsz), tier={"A": 1, "B": 2, "C": 3}[session], eval_sizes=bigger_eval_sizes(imgsz), notes=notes))
     if session == "A":  # interleaved so that a partial session still has paired seeds
         for sd in (0, 1, 2):
             add(M, family, sd, 896, notes="C1")
             add(B, family, sd, 896, notes="C1")
     elif session == "B":
+        add(M, family, 1, 896, notes="control: batch 32 (session A used 16 for the model)", batch=32)
         add(M, family, 0, 1280, notes="C4")
         add(B, family, 0, 1280, notes="C4")
         add(M, family, 0, 640, long_epochs, notes="C2")
