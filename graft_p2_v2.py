@@ -2535,6 +2535,10 @@ def autopilot(work, session="A", budget_h=10.0, epochs=90, notebook_file=None, s
         hf_tag = old_plan["hf_tag"]  # a restarted autopilot continues in the same folder
     hf_resume = (hf_resume or "").strip().strip("/")
     if hf_resume:
+        if hf_resume.startswith("session") and len(hf_resume) > 7 and hf_resume[7] != session:
+            steps.append({"step": "check RESUME against the session", "ok": False, "seconds": 0.0,
+                          "detail": f"the folder '{hf_resume}' belongs to session {hf_resume[7]} but session {session} is selected: choose session {hf_resume[7]} in the first dropdown, otherwise the wrong runs are trained"})
+            return fail()
         hf_tag = hf_resume  # continue in the same folder
     if hf_repo and hf_token:
         if not step("Hugging Face access (results are pushed there during the run)", lambda: hf_check(hf_repo, hf_token, hf_tag)):
